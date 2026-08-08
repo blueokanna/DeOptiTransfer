@@ -1,121 +1,94 @@
 # deopti-transfer
 
-The no_std LT Fountain Code Core for Unidirectional Optical Data Transfer.
+`deopti-transfer` is a `no_std + alloc` fountain-code core for one-way optical
+file transfer. A sender continuously emits self-contained frames; a receiver
+can reconstruct the stream without acknowledgements or retransmission control.
 
-A bit-exact, zero-handshake engine that transmits files over a one-way visual
-channel — a screen streaming animated QR codes to a camera. No back-channel,
-no retransmission: the sender emits an endless fountain of coded frames and
-the receiver peels the file out of any ~K·1.15 distinct frames, in any order.
-Dropped frames cost time, never correctness.
+The current wire protocol is version 3 (frame magic `D1 0F`). Version 2 frames
+are intentionally rejected because they do not contain a per-frame integrity
+tag and can poison the decoder with a corrupted equation.
 
-Protocol version **2** (frame magic `D1 0E`).
+## Causal weave
 
-## Hybrid systematic-robust-soliton distribution
+The session sender uses the causal mode by default. For source blocks
+`x[0]..x[K-1]`, its first phase emits:
 
-The session layer defaults to systematic (`Sender::new`); the low-level
-codec defaults to pure RSD (`LtEncoder::new`, wire-compatible with the
-original sampling), with `LtEncoder::new_systematic` / `LtDecoder::new_systematic`
-selecting the hybrid. The frame header's flags byte carries the mode, so the
-receiver adapts automatically (the protocol stays self-describing).
+```text
+y[0] = x[0]
+y[i] = x[i-1] XOR x[i]    for 1 <= i < K
+```
 
-Measured frames-needed-to-complete (K=139, deterministic per-seq drop mask,
-identical coded frames available to all decoders):
+This is an invertible lower-bidiagonal encoding matrix. Receiving the first
+`K` frames, in any order, reconstructs the payload in exactly `K` frames. A
+missing first-phase frame cuts the chain into components instead of leaving an
+isolated missing source block. When a later repair equation solves one member
+of a component, peeling propagates through all received edges in that component.
+After the first phase, the sender emits deterministic robust-soliton LT repair
+equations indefinitely, so a receiver that starts late can still decode.
 
-| Loss rate | Systematic (1 lap) | Pure RSD |
-| --- | --- | --- |
-| 0% | **1.000 ×K** | 1.317 ×K |
-| 10% | 1.403 ×K | 1.173 ×K |
-| 30% | 1.554 ×K | 1.317 ×K |
+The construction is pinned by golden vectors and tested in reverse frame order,
+with isolated cuts, and under deterministic loss. For `K=139` with the same
+per-sequence drop mask, frames admitted by the decoder were:
 
-At zero loss the systematic phase completes in **exactly K frames** (provable
-and tested: `systematic_phase_completes_in_exactly_k_frames`) — 24% fewer
-frames than pure RSD. Under loss, the residual sub-problem exhibits the
-**systematic puncturing effect** known from systematic LT codes: frames whose
-blocks are already solved carry no new information, so the tail decodes less
-efficiently. The measured crossover sits below 10% loss. Use systematic for
-a well-positioned low-loss camera link; use pure RSD for lossy channels. A
-receiver that locks on mid-stream (after the systematic phase) still decodes
-from the coded tail alone (tested).
+| Drop rate | Causal | Direct systematic | Pure RSD |
+| --- | ---: | ---: | ---: |
+| 0% | 1.000 K | 1.000 K | 1.317 K |
+| 10% | 1.043 K | 1.403 K | 1.173 K |
+| 30% | 1.554 K | 1.554 K | 1.317 K |
 
-A multi-lap variant (each source block emitted twice) was implemented and
-**measured and rejected**: at 10% loss it needed 2.14×K frames. The residual
-set shrinks to p²·K, but the LT tail then starves for degree-1 frames against
-a tiny target set (~200 coded frames to hit 1–2 residual blocks), which is
-worse than both alternatives. The negative result is reported here rather
-than shipped.
+These are deterministic regression measurements, not a general channel model
+or a claim of academic novelty. Applications can explicitly select direct
+systematic or pure RSD when their measured channel favors one of those modes.
 
-## Authenticated encryption (anti-co-reception)
+## Frame integrity and session isolation
 
-The optical channel is a public broadcast: **any camera pointed at the screen
-receives the same frames**. With the `encryption` feature, containers are
-encrypted so a co-receiver or mid-path observer sees only ciphertext:
+Each 25-byte frame header contains two separate BLAKE3-derived 32-bit tags:
 
-- **AEAD**: XChaCha20-Poly1305 (RustCrypto, no_std), 24-byte nonce, 16-byte
-  tag. The header, name, type and digest are **authenticated as associated
-  data** — tampering with any field fails the tag before decryption.
-- **Keys**: `EncryptionKey` (32 bytes, redacted `Debug`), derived from a
-  password via `blake3::derive_key` (HKDF-based KDF), or supplied directly.
-  Strength is the password's responsibility, as usual.
-- **Nonces**: 24 bytes, unique per encryption under a key. `random_nonce()`
-  (std builds) uses the OS RNG; no_std applications supply their own (e.g.,
-  from an embedded TRNG).
-- **Layout**: DCF3 container, 73-byte header, `flags` bit1 = encrypted; the
-  transmitted payload is ciphertext+tag. `unpack_file_with_key` verifies the
-  tag, decrypts, then re-checks the BLAKE3 digest of the recovered plaintext.
-- An encrypted container unpacked without a key, with the wrong key, or with
-  a single flipped byte is rejected (tested).
+- `frame_tag` covers the canonical frame header and block before the equation
+  enters the decoder. A damaged frame is treated as an erasure and the same
+  sequence number can be admitted later.
+- `stream_tag` identifies the complete transmitted container and is checked
+  again after reconstruction.
 
-## Performance & data-structure design
+The 32-bit tags detect accidental optical corruption; they are not message
+authentication codes. Use the `encryption` feature against active tampering.
 
-- **SIMD XOR engine** (`simd`): runtime-dispatched AVX2 (via `__cpuid` +
-  `_xgetbv` XCR0 check), SSE2, NEON, scalar — no_std through `core::arch`.
-  Measured 22.2 GiB/s on a 4 MiB buffer.
-- **Flat word arena** (`LtDecoder`): all frame words live in one `Vec<u32>`
-  carved by index (stable across growth) — **no per-frame heap allocation**;
-  disjoint ranges are XORed via `split_at_mut`.
-- **Two-level quantized degree sampling** (`DegreeCdf`): a 1024-entry
-  quantile table narrows the inverse-CDF search to a small cache-warm window;
-  **exactly equal** to binary search (proven over a 2^20 grid + 100k random
-  samples per K).
-- **Bijective multiplicative-hash dedup** (`U32Set`): open addressing where
-  `v·0x9E3779B1 mod 2^t` is a bijection — sequential seq numbers never
-  collide; packed occupancy bits; amortized rehash at 0.7 load.
+A receiver locks to the first valid stream identity. Frames from another stream
+return `Error::StreamConflict` without discarding current progress. Call
+`Receiver::reset` to select a different stream deliberately. Decoder payload
+storage is bounded to four times the source-block arena, and capacity is checked
+before the sequence deduplication set can grow.
 
-### Benchmarks
+## Authenticated encryption
 
-`criterion 0.8`, Intel Core i7-11850H @ 2.50 GHz, 32 GB; `BLOCK_LEN=2933`;
-reproduce with `cargo bench`.
+The optional `encryption` feature uses XChaCha20-Poly1305. Container metadata,
+declared lengths, digest, name, and media type are authenticated as associated
+data. The plaintext is verified with BLAKE3 after decryption and decompression.
 
-| Group | Case | Median | Throughput |
-| --- | --- | --- | --- |
-| xor | dispatched (AVX2) | 175.8 µs | 22.22 GiB/s |
-| xor | scalar reference | 216.5 µs | 18.05 GiB/s |
-| encode | stream, 1 MiB | 3.766 ms | 360.3 MiB/s |
-| encode | stream, 32 MiB | 312.0 ms | 136.8 MiB/s |
-| decode | peel, 1 MiB | 1.240 ms | 806.3 MiB/s |
-| decode | peel, 32 MiB | 67.45 ms | 474.4 MiB/s |
+Two key paths are available:
 
-Decode runs at **3.8–6.5 Gbps**, encode at **1.1–2.9 Gbps** — both above the
-1 Gbps target. Encode falls off with payload size because random block access
-from a multi-MB table is memory-latency-bound (not compute); decode reads the
-same table cache-warm. The optical channel itself consumes these frames at
-~0.1–0.2 MB/s, three orders of magnitude below the codec.
+- `EncryptionKey::new` accepts a high-entropy 32-byte key.
+- Password helpers use Argon2id with a 19 MiB memory cost, two iterations, one
+  lane, and the per-container 24-byte nonce as salt.
 
-## Security model
+Nonces must be unique for each encryption under a direct key. On `std` builds,
+`random_nonce()` obtains 24 bytes from the operating-system RNG and returns an
+error if randomness is unavailable. Embedded applications must supply nonces
+from a suitable platform RNG.
 
-Every field from the optical channel is validated before use: stream headers
-must be consistent (`k == ceil(total/block)`, `total ≤ 64 MiB`), pending
-frame memory is capped at 4× payload, gzip inflate is hard-bounded, and
-authenticated encryption covers the container. The per-frame FNV-1a is a
-corruption check, not authentication — with `encryption`, integrity comes
-from the AEAD tag.
+## Limits
 
-## no_std
+- Original file: at most 64 MiB.
+- Metadata fields: at most 65,535 bytes each.
+- Source blocks: at most 65,535.
+- Block length: 1 through 65,535 bytes.
+- The stream limit separately includes the container header, metadata, and AEAD
+  tag, so a valid 64 MiB file does not become unsendable after packaging.
 
-`--no-default-features` builds pure `no_std + alloc` (verified). Features:
-`std` (gzip via flate2), `encryption` (XChaCha20-Poly1305 + `getrandom`).
-Dependencies: `rustbinary`, `serde` (derive), `blake3`, `libm`,
-`chacha20poly1305` + `getrandom` (encryption only), `flate2` (std only).
+All untrusted lengths are validated before decoder allocation or decompression.
+Gzip output is bounded by the declared original length. Sender checked
+constructors reject empty input and invalid sizes, and `try_next_frame` reports
+sequence exhaustion instead of wrapping to duplicate sequence numbers.
 
 ## Usage
 
@@ -126,29 +99,47 @@ deopti-transfer = { version = "0.1", features = ["encryption"] }
 
 ```rust
 use deopti_transfer::container::{pack_file, unpack_file};
-use deopti_transfer::crypto::EncryptionKey;
 use deopti_transfer::session::{Receiver, Sender};
 
-let key = EncryptionKey::from_password("correct horse battery staple");
-let packed = pack_file("notes.txt", "text/plain", b"...")?;
-
-let mut sender = Sender::from_packed(&packed, 1465, 0x0c_d1);
+# fn run() -> deopti_transfer::Result<()> {
+let packed = pack_file("notes.txt", "text/plain", b"payload")?;
+let mut sender = Sender::try_from_packed(&packed, 1465, 0x0cd1)?;
 let mut receiver = Receiver::new();
-let wire = sender.next_frame().to_bytes();
-if let Some(container) = receiver.push(&wire) {
-    let file = unpack_file(&container)?;
+
+loop {
+    let wire = sender.try_next_frame()?.to_bytes();
+    if let Some(container) = receiver.try_push(&wire)? {
+        let file = unpack_file(&container)?;
+        assert_eq!(file.bytes, b"payload");
+        break;
+    }
 }
+# Ok(())
+# }
 ```
 
-## Wire-format guarantees
+Password encryption is available through `pack_file_encrypted_with_password`
+and `unpack_file_with_password`. The nonce is stored in the container header;
+only the password must be transferred out of band.
 
-The derivation chain — `dlog`, the robust-soliton CDF, `frame_seed`,
-`SplitMix32`, `frame_indices` — is pinned by golden-vector tests, including an
-exhaustive FNV-1a fingerprint of `dlog`. `rustbinary`'s fixed-width
-little-endian profile reproduces the 21-byte frame header and 73-byte
-container header byte-for-byte. The systematic stream has its own pinned
-fingerprints.
+## Feature matrix
+
+- Default `std`: bounded gzip compression and decompression.
+- `--no-default-features`: pure `no_std + alloc` codec and uncompressed
+  containers.
+- `encryption`: XChaCha20-Poly1305, Argon2id, key zeroization, and OS nonce
+  generation when `std` is also enabled.
+
+Run the verification matrix with:
+
+```text
+cargo test --all-features
+cargo check --no-default-features
+cargo check --no-default-features --features encryption
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt -- --check
+```
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache-2.0. See `LICENSE`.

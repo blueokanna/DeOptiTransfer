@@ -1,11 +1,11 @@
-﻿use alloc::string::{String, ToString};
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use rustbinary::Config;
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::NONCE_LEN;
 #[cfg(feature = "encryption")]
 use crate::crypto::{decrypt, encrypt, EncryptionKey, TAG_LEN};
-use crate::crypto::NONCE_LEN;
 use crate::error::{Error, Result};
 use crate::frame::MAX_FILE_BYTES;
 
@@ -67,8 +67,20 @@ struct Header {
 
 pub fn pack_file(name: &str, mime_type: &str, bytes: &[u8]) -> Result<PackedOpticalFile> {
     let (name_bytes, type_bytes, plain, compression, digest) = prepare(name, mime_type, bytes)?;
-    let flags = if compression == Compression::Gzip { FLAG_GZIP } else { 0 };
-    let container = assemble(flags, &name_bytes, &type_bytes, &plain, bytes.len(), &digest, &[0u8; NONCE_LEN])?;
+    let flags = if compression == Compression::Gzip {
+        FLAG_GZIP
+    } else {
+        0
+    };
+    let container = assemble(
+        flags,
+        &name_bytes,
+        &type_bytes,
+        &plain,
+        bytes.len(),
+        &digest,
+        &[0u8; NONCE_LEN],
+    )?;
     Ok(PackedOpticalFile {
         container,
         compression,
@@ -87,10 +99,29 @@ pub fn pack_file_encrypted(
     nonce: &[u8; NONCE_LEN],
 ) -> Result<PackedOpticalFile> {
     let (name_bytes, type_bytes, plain, compression, digest) = prepare(name, mime_type, bytes)?;
-    let flags = (if compression == Compression::Gzip { FLAG_GZIP } else { 0 }) | FLAG_CRYPT;
-    let aad = aad(flags, &name_bytes, &type_bytes, bytes.len(), plain.len() + TAG_LEN, &digest);
+    let flags = (if compression == Compression::Gzip {
+        FLAG_GZIP
+    } else {
+        0
+    }) | FLAG_CRYPT;
+    let aad = aad(
+        flags,
+        &name_bytes,
+        &type_bytes,
+        bytes.len(),
+        plain.len() + TAG_LEN,
+        &digest,
+    );
     let ciphertext = encrypt(key.bytes(), nonce, &plain, &aad)?;
-    let container = assemble(flags, &name_bytes, &type_bytes, &ciphertext, bytes.len(), &digest, nonce)?;
+    let container = assemble(
+        flags,
+        &name_bytes,
+        &type_bytes,
+        &ciphertext,
+        bytes.len(),
+        &digest,
+        nonce,
+    )?;
     Ok(PackedOpticalFile {
         container,
         compression,
@@ -98,6 +129,18 @@ pub fn pack_file_encrypted(
         original_size: bytes.len(),
         transmitted_size: ciphertext.len(),
     })
+}
+
+#[cfg(feature = "encryption")]
+pub fn pack_file_encrypted_with_password(
+    name: &str,
+    mime_type: &str,
+    bytes: &[u8],
+    password: &[u8],
+    nonce: &[u8; NONCE_LEN],
+) -> Result<PackedOpticalFile> {
+    let key = EncryptionKey::from_password(password, nonce)?;
+    pack_file_encrypted(name, mime_type, bytes, &key, nonce)
 }
 
 type Prepared = (Vec<u8>, Vec<u8>, Vec<u8>, Compression, [u8; 32]);
@@ -124,13 +167,13 @@ fn prepare(name: &str, mime_type: &str, bytes: &[u8]) -> Result<Prepared> {
     let digest = *blake3::hash(bytes).as_bytes();
 
     #[cfg(feature = "std")]
-    let compressed: Option<Vec<u8>> = if bytes.len() >= GZIP_MIN && !is_precompressed_type(mime_type)
-    {
-        let c = gzip(bytes)?;
-        (c.len() + GZIP_ROOM < bytes.len()).then_some(c)
-    } else {
-        None
-    };
+    let compressed: Option<Vec<u8>> =
+        if bytes.len() >= GZIP_MIN && !is_precompressed_type(mime_type) {
+            let c = gzip(bytes)?;
+            (c.len() + GZIP_ROOM < bytes.len()).then_some(c)
+        } else {
+            None
+        };
     #[cfg(not(feature = "std"))]
     let compressed: Option<Vec<u8>> = None;
 
@@ -167,9 +210,7 @@ fn assemble(
     };
     let mut container = CFG
         .serialize(&header)
-        .map_err(|e| Error::Codec {
-            msg: e.to_string(),
-        })?;
+        .map_err(|e| Error::Codec { msg: e.to_string() })?;
     container.extend_from_slice(name_bytes);
     container.extend_from_slice(type_bytes);
     container.extend_from_slice(transmitted);
@@ -185,35 +226,26 @@ pub fn unpack_file_with_key(container: &[u8], key: &EncryptionKey) -> Result<Opt
     unpack_impl(container, Some(key.bytes()))
 }
 
+#[cfg(feature = "encryption")]
+pub fn unpack_file_with_password(container: &[u8], password: &[u8]) -> Result<OpticalFile> {
+    let header = read_header(container)?;
+    if header.flags & FLAG_CRYPT == 0 {
+        return Err(Error::NoEncryption);
+    }
+    validate_layout(&header, container.len())?;
+    let key = EncryptionKey::from_password(password, &header.nonce)?;
+    unpack_impl(container, Some(key.bytes()))
+}
+
 fn unpack_impl(container: &[u8], key: Option<&[u8; 32]>) -> Result<OpticalFile> {
     #[cfg(not(feature = "encryption"))]
     let _ = key;
-    if container.len() < FILE_HEADER_LEN {
-        return Err(Error::Truncated);
-    }
-    let h: Header = CFG
-        .deserialize(&container[..FILE_HEADER_LEN])
-        .map_err(|e| Error::Codec {
-            msg: e.to_string(),
-        })?;
-    if h.magic != FILE_MAGIC {
-        return Err(Error::BadMagic);
-    }
-    if h.flags & !(FLAG_GZIP | FLAG_CRYPT) != 0 {
-        return Err(Error::BadMagic);
-    }
+    let h = read_header(container)?;
     let compressed = h.flags & FLAG_GZIP != 0;
     let encrypted = h.flags & FLAG_CRYPT != 0;
 
+    validate_layout(&h, container.len())?;
     let data_offset = FILE_HEADER_LEN + h.name_len as usize + h.type_len as usize;
-    if h.file_len == 0
-        || (h.file_len as u64) > MAX_FILE_BYTES
-        || h.xmit_len == 0
-        || (h.xmit_len as u64) > MAX_FILE_BYTES
-        || data_offset + h.xmit_len as usize != container.len()
-    {
-        return Err(Error::Lengths);
-    }
     let name_bytes = &container[FILE_HEADER_LEN..FILE_HEADER_LEN + h.name_len as usize];
     let type_bytes = &container[FILE_HEADER_LEN + h.name_len as usize..data_offset];
     let transmitted = &container[data_offset..];
@@ -229,7 +261,14 @@ fn unpack_impl(container: &[u8], key: Option<&[u8; 32]>) -> Result<OpticalFile> 
         #[cfg(feature = "encryption")]
         {
             let key = key.ok_or(Error::NoEncryption)?;
-            let aad = aad(h.flags, name_bytes, type_bytes, h.file_len as usize, h.xmit_len as usize, &h.digest);
+            let aad = aad(
+                h.flags,
+                name_bytes,
+                type_bytes,
+                h.file_len as usize,
+                h.xmit_len as usize,
+                &h.digest,
+            );
             decrypt(key, &h.nonce, transmitted, &aad)?
         }
         #[cfg(not(feature = "encryption"))]
@@ -266,6 +305,9 @@ fn unpack_impl(container: &[u8], key: Option<&[u8; 32]>) -> Result<OpticalFile> 
         plain
     };
 
+    if bytes.len() != h.file_len as usize {
+        return Err(Error::Lengths);
+    }
     if blake3::hash(&bytes).as_bytes() != &h.digest {
         return Err(Error::Crypto);
     }
@@ -282,10 +324,47 @@ fn unpack_impl(container: &[u8], key: Option<&[u8; 32]>) -> Result<OpticalFile> 
         mime_type,
         bytes,
         digest: h.digest,
-        compression: if compressed { Compression::Gzip } else { Compression::None },
+        compression: if compressed {
+            Compression::Gzip
+        } else {
+            Compression::None
+        },
         encrypted,
         transmitted_size: h.xmit_len as usize,
     })
+}
+
+fn read_header(container: &[u8]) -> Result<Header> {
+    if container.len() < FILE_HEADER_LEN {
+        return Err(Error::Truncated);
+    }
+    let header: Header = CFG
+        .deserialize(&container[..FILE_HEADER_LEN])
+        .map_err(|e| Error::Codec { msg: e.to_string() })?;
+    if header.magic != FILE_MAGIC || header.flags & !(FLAG_GZIP | FLAG_CRYPT) != 0 {
+        return Err(Error::BadMagic);
+    }
+    Ok(header)
+}
+
+fn validate_layout(header: &Header, container_len: usize) -> Result<()> {
+    let encrypted = header.flags & FLAG_CRYPT != 0;
+    let data_offset = FILE_HEADER_LEN + header.name_len as usize + header.type_len as usize;
+    let max_xmit_len = MAX_FILE_BYTES
+        + if encrypted {
+            crate::crypto::TAG_LEN as u64
+        } else {
+            0
+        };
+    if header.file_len == 0
+        || header.file_len as u64 > MAX_FILE_BYTES
+        || header.xmit_len == 0
+        || header.xmit_len as u64 > max_xmit_len
+        || data_offset + header.xmit_len as usize != container_len
+    {
+        return Err(Error::Lengths);
+    }
+    Ok(())
 }
 
 #[cfg(feature = "encryption")]
@@ -335,7 +414,12 @@ fn is_control(c: char) -> bool {
 }
 
 pub fn is_precompressed_type(mime_type: &str) -> bool {
-    let media = mime_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let media = mime_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     if let Some(subtype) = media.strip_prefix("image/") {
         return !matches!(
             subtype,
@@ -393,9 +477,9 @@ fn gunzip(bytes: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut buf = [0u8; 32 * 1024];
     loop {
-        let n = decoder.read(&mut buf).map_err(|e| Error::Inflate {
-            msg: e.to_string(),
-        })?;
+        let n = decoder
+            .read(&mut buf)
+            .map_err(|e| Error::Inflate { msg: e.to_string() })?;
         if n == 0 {
             break;
         }

@@ -1,6 +1,6 @@
-﻿use deopti_transfer::dlog::dlog;
+use deopti_transfer::dlog::dlog;
 use deopti_transfer::fountain::{frame_indices, LtEncoder};
-use deopti_transfer::frame::{fnv1a, pack_frame, FrameHeader, HEADER_LEN};
+use deopti_transfer::frame::{fnv1a, frame_checksum, pack_frame, FrameHeader, HEADER_LEN};
 use deopti_transfer::soliton::soliton_cdf;
 
 fn test_payload(len: usize) -> Vec<u8> {
@@ -74,10 +74,19 @@ fn frame_indices_subsets() {
     let golden: [(usize, [&[u32]; 5]); 5] = [
         (1, [&[0], &[0], &[0], &[0], &[0]]),
         (2, [&[1], &[1], &[1], &[0], &[1]]),
-        (17, [&[3, 14], &[12, 0], &[6, 8], &[15, 16, 13], &[11, 2, 16]]),
+        (
+            17,
+            [&[3, 14], &[12, 0], &[6, 8], &[15, 16, 13], &[11, 2, 16]],
+        ),
         (
             179,
-            [&[27, 39], &[30, 55], &[155, 125], &[28, 132, 88], &[39, 75, 24]],
+            [
+                &[27, 39],
+                &[30, 55],
+                &[155, 125],
+                &[28, 132, 88],
+                &[39, 75, 24],
+            ],
         ),
         (
             716,
@@ -139,22 +148,51 @@ fn systematic_encoded_stream_fingerprints() {
 }
 
 #[test]
+fn causal_encoded_stream_fingerprints() {
+    let cases: [(usize, usize, u32); 4] = [
+        (1, 64, 1),
+        (23, 64, 7),
+        (179, 2933, 4242),
+        (716, 1445, 65535),
+    ];
+    let actual: Vec<u32> = cases
+        .into_iter()
+        .map(|(k, block_len, session_id)| {
+            let payload = test_payload(k * block_len - 7);
+            let mut encoder = LtEncoder::new_causal(&payload, block_len, session_id);
+            let mut stream = Vec::with_capacity(64 * block_len);
+            for seq in 0..64u32 {
+                stream.extend_from_slice(&encoder.encode(seq));
+            }
+            fnv1a(&stream)
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        vec![0xf6a1_15c5, 0x493f_7d92, 0x5a27_8a67, 0x088f_9b09]
+    );
+}
+
+#[test]
 fn frame_header_wire_bytes() {
-    let header = FrameHeader {
+    let block_bytes = [1, 2, 3, 4, 5, 6];
+    let mut header = FrameHeader {
         flags: 0,
         session_id: 0xbeef,
         seq: 0x0102_0304,
         k: 0x0111,
         block_len: 6,
         total_len: 0x00fe_dcba,
-        payload_fnv: 0x89ab_cdef,
+        stream_tag: 0x89ab_cdef,
+        frame_tag: 0,
     };
-    let frame = pack_frame(&header, &[1, 2, 3, 4, 5, 6]);
+    header.frame_tag = frame_checksum(&header, &block_bytes);
+    let frame = pack_frame(&header, &block_bytes);
     assert_eq!(frame.len(), HEADER_LEN + 6);
     let hex: Vec<String> = frame.iter().map(|b| format!("{b:02x}")).collect();
     assert_eq!(
         hex.join(" "),
-        "d1 0e 00 ef be 04 03 02 01 11 01 06 00 ba dc fe 00 ef cd ab 89 01 02 03 04 05 06"
+        "d1 0f 00 ef be 04 03 02 01 11 01 06 00 ba dc fe 00 ef cd ab 89 d6 d8 ac 55 01 02 03 04 05 06"
     );
     let (parsed, block) = deopti_transfer::parse_frame(&frame).expect("round trip");
     assert_eq!(parsed, header);

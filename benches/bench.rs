@@ -116,5 +116,12 @@ fn bench_decode(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_xor, bench_sample, bench_seen, bench_encode, bench_decode);
+criterion_group!(
+    benches,
+    bench_xor,
+    bench_sample,
+    bench_seen,
+    bench_encode,
+    bench_decode
+);
 criterion_main!(benches);

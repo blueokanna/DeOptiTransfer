@@ -12,6 +12,10 @@ pub enum Error {
     Compression(u8),
     Lengths,
     InvalidStream,
+    InvalidFrameSize { actual: usize, expected: usize },
+    SequenceExhausted,
+    CorruptFrame,
+    StreamConflict,
     GzipIncomplete,
     GzipSize,
     Inflate { msg: String },
@@ -32,6 +36,12 @@ impl fmt::Display for Error {
             Error::Compression(m) => write!(f, "unsupported compression {m}"),
             Error::Lengths => write!(f, "length mismatch"),
             Error::InvalidStream => write!(f, "inconsistent stream header"),
+            Error::InvalidFrameSize { actual, expected } => {
+                write!(f, "invalid frame size {actual}, expected {expected}")
+            }
+            Error::SequenceExhausted => write!(f, "frame sequence exhausted"),
+            Error::CorruptFrame => write!(f, "frame integrity check failed"),
+            Error::StreamConflict => write!(f, "receiver is locked to another stream"),
             Error::GzipIncomplete => write!(f, "gzip payload incomplete"),
             Error::GzipSize => write!(f, "gzip size mismatch"),
             Error::Inflate { msg } => write!(f, "inflate: {msg}"),

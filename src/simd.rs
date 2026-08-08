@@ -123,6 +123,7 @@ fn xor_scalar(dst: &mut [u32], src: &[u32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     fn reference(dst: &mut [u32], src: &[u32]) {
         for (d, s) in dst.iter_mut().zip(src) {

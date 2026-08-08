@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use crate::bytes::{words_as_bytes, words_as_bytes_mut};
 use crate::capacity::MAX_SOURCE_BLOCKS;
 use crate::error::{Error, Result};
-use crate::frame::MAX_FILE_BYTES;
+use crate::frame::MAX_STREAM_BYTES;
 use crate::prng::{frame_seed, SplitMix32};
 use crate::set::U32Set;
 use crate::simd::xor_into;
@@ -37,7 +37,13 @@ fn frame_indices_into(
     select_blocks(out, scratch, k, d, &mut rnd);
 }
 
-fn select_blocks(out: &mut Vec<u32>, scratch: &mut Vec<u32>, k: usize, d: usize, rnd: &mut SplitMix32) {
+fn select_blocks(
+    out: &mut Vec<u32>,
+    scratch: &mut Vec<u32>,
+    k: usize,
+    d: usize,
+    rnd: &mut SplitMix32,
+) {
     if d > (k >> 3) {
         if scratch.len() < k {
             scratch.resize(k, 0);
@@ -71,6 +77,7 @@ pub struct LtEncoder {
     words: usize,
     session_id: u32,
     sys_span: usize,
+    causal: bool,
     blocks: Vec<u32>,
     cdf: DegreeCdf,
     idx: Vec<u32>,
@@ -80,19 +87,42 @@ pub struct LtEncoder {
 
 impl LtEncoder {
     pub fn new(payload: &[u8], block_len: usize, session_id: u32) -> Self {
-        Self::with_sys_span(payload, block_len, session_id, 0)
+        Self::try_new(payload, block_len, session_id).expect("valid encoder parameters")
+    }
+
+    pub fn try_new(payload: &[u8], block_len: usize, session_id: u32) -> Result<Self> {
+        Self::try_with_mode(payload, block_len, session_id, 0, false)
     }
 
     pub fn new_systematic(payload: &[u8], block_len: usize, session_id: u32) -> Self {
-        let k = payload.len().div_ceil(block_len).max(1);
-        Self::with_sys_span(payload, block_len, session_id, k)
+        Self::try_new_systematic(payload, block_len, session_id).expect("valid encoder parameters")
     }
 
-    fn with_sys_span(payload: &[u8], block_len: usize, session_id: u32, sys_span: usize) -> Self {
-        assert!(block_len > 0, "block_len must be positive");
-        let k = payload.len().div_ceil(block_len).max(1);
+    pub fn try_new_systematic(payload: &[u8], block_len: usize, session_id: u32) -> Result<Self> {
+        let k = checked_encoder_k(payload, block_len)?;
+        Self::try_with_mode(payload, block_len, session_id, k, false)
+    }
+
+    pub fn new_causal(payload: &[u8], block_len: usize, session_id: u32) -> Self {
+        Self::try_new_causal(payload, block_len, session_id).expect("valid encoder parameters")
+    }
+
+    pub fn try_new_causal(payload: &[u8], block_len: usize, session_id: u32) -> Result<Self> {
+        let k = checked_encoder_k(payload, block_len)?;
+        Self::try_with_mode(payload, block_len, session_id, k, true)
+    }
+
+    fn try_with_mode(
+        payload: &[u8],
+        block_len: usize,
+        session_id: u32,
+        sys_span: usize,
+        causal: bool,
+    ) -> Result<Self> {
+        let k = checked_encoder_k(payload, block_len)?;
         let words = block_len.div_ceil(4);
-        let mut blocks = vec![0u32; k * words];
+        let arena_words = k.checked_mul(words).ok_or(Error::InvalidStream)?;
+        let mut blocks = vec![0u32; arena_words];
         {
             let bytes = words_as_bytes_mut(&mut blocks);
             for b in 0..k {
@@ -102,18 +132,19 @@ impl LtEncoder {
                 bytes[dst..dst + (end - start)].copy_from_slice(&payload[start..end]);
             }
         }
-        Self {
+        Ok(Self {
             k,
             block_len,
             words,
             session_id,
             sys_span,
+            causal,
             blocks,
             cdf: DegreeCdf::new(k),
             idx: Vec::new(),
             idx_scratch: Vec::new(),
             acc: vec![0u32; words],
-        }
+        })
     }
 
     #[inline]
@@ -133,7 +164,12 @@ impl LtEncoder {
 
     #[inline]
     pub fn is_systematic(&self) -> bool {
-        self.sys_span > 0
+        self.sys_span > 0 && !self.causal
+    }
+
+    #[inline]
+    pub fn is_causal(&self) -> bool {
+        self.causal
     }
 
     #[inline]
@@ -148,11 +184,24 @@ impl LtEncoder {
     }
 
     pub fn encode_into(&mut self, seq: u32, out: &mut [u8]) {
-        assert_eq!(out.len(), self.block_len, "output buffer must be block_len bytes");
+        assert_eq!(
+            out.len(),
+            self.block_len,
+            "output buffer must be block_len bytes"
+        );
         if (seq as usize) < self.sys_span {
-            let base = ((seq as usize) % self.k) * self.words;
-            out.copy_from_slice(&words_as_bytes(&self.blocks[base..base + self.words])
-                [..self.block_len]);
+            let current = (seq as usize) * self.words;
+            if self.causal && seq != 0 {
+                let previous = current - self.words;
+                self.acc
+                    .copy_from_slice(&self.blocks[current..current + self.words]);
+                xor_into(&mut self.acc, &self.blocks[previous..previous + self.words]);
+                out.copy_from_slice(&words_as_bytes(&self.acc)[..self.block_len]);
+            } else {
+                out.copy_from_slice(
+                    &words_as_bytes(&self.blocks[current..current + self.words])[..self.block_len],
+                );
+            }
             return;
         }
         frame_indices_into(
@@ -264,6 +313,7 @@ pub struct LtDecoder {
     session_id: u32,
     total_len: usize,
     sys_span: usize,
+    causal: bool,
     cdf: DegreeCdf,
     solved: Vec<Option<usize>>,
     solved_count: usize,
@@ -290,7 +340,7 @@ impl LtDecoder {
     }
 
     pub fn try_new(k: usize, block_len: usize, session_id: u32, total_len: usize) -> Result<Self> {
-        Self::try_new_mode(k, block_len, session_id, total_len, 0)
+        Self::try_new_mode(k, block_len, session_id, total_len, 0, false)
     }
 
     pub fn try_new_systematic(
@@ -299,7 +349,21 @@ impl LtDecoder {
         session_id: u32,
         total_len: usize,
     ) -> Result<Self> {
-        Self::try_new_mode(k, block_len, session_id, total_len, k)
+        Self::try_new_mode(k, block_len, session_id, total_len, k, false)
+    }
+
+    pub fn new_causal(k: usize, block_len: usize, session_id: u32, total_len: usize) -> Self {
+        Self::try_new_causal(k, block_len, session_id, total_len)
+            .expect("consistent stream parameters")
+    }
+
+    pub fn try_new_causal(
+        k: usize,
+        block_len: usize,
+        session_id: u32,
+        total_len: usize,
+    ) -> Result<Self> {
+        Self::try_new_mode(k, block_len, session_id, total_len, k, true)
     }
 
     fn try_new_mode(
@@ -308,6 +372,7 @@ impl LtDecoder {
         session_id: u32,
         total_len: usize,
         sys_span: usize,
+        causal: bool,
     ) -> Result<Self> {
         if k == 0 || block_len == 0 || total_len == 0 {
             return Err(Error::InvalidStream);
@@ -315,10 +380,10 @@ impl LtDecoder {
         if k > MAX_SOURCE_BLOCKS || block_len > u16::MAX as usize {
             return Err(Error::InvalidStream);
         }
-        if (total_len as u64) > MAX_FILE_BYTES {
+        if (total_len as u64) > MAX_STREAM_BYTES {
             return Err(Error::TooLarge {
                 len: total_len as u64,
-                max: MAX_FILE_BYTES,
+                max: MAX_STREAM_BYTES,
             });
         }
         if k != total_len.div_ceil(block_len) {
@@ -333,6 +398,7 @@ impl LtDecoder {
             session_id,
             total_len,
             sys_span,
+            causal,
             cdf: DegreeCdf::new(k),
             solved: vec![None; k],
             solved_count: 0,
@@ -356,7 +422,12 @@ impl LtDecoder {
 
     #[inline]
     pub fn is_systematic(&self) -> bool {
-        self.sys_span > 0
+        self.sys_span > 0 && !self.causal
+    }
+
+    #[inline]
+    pub fn is_causal(&self) -> bool {
+        self.causal
     }
 
     #[inline]
@@ -380,34 +451,51 @@ impl LtDecoder {
     }
 
     pub fn add_frame(&mut self, seq: u32, block: &[u8]) {
+        if block.len() != self.block_len {
+            self.frames_dropped += 1;
+            return;
+        }
+        if self.is_complete() {
+            return;
+        }
+        if self.arena.len().saturating_add(self.words) > self.max_arena_words {
+            self.frames_dropped += 1;
+            return;
+        }
         if !self.seen.insert(seq) {
             self.frames_dup += 1;
             return;
         }
         self.frames_new += 1;
-        if self.is_complete() {
-            return;
-        }
-        if self.arena.len() >= self.max_arena_words {
-            self.frames_dropped += 1;
-            return;
-        }
 
         let off = self.arena.len();
         self.arena.resize(off + self.words, 0);
         {
-            let n = block.len().min(self.block_len);
-            words_as_bytes_mut(&mut self.arena[off..off + self.words])[..n]
-                .copy_from_slice(&block[..n]);
+            words_as_bytes_mut(&mut self.arena[off..off + self.words])[..self.block_len]
+                .copy_from_slice(block);
         }
 
-        if (seq as usize) < self.sys_span {
+        if (seq as usize) < self.sys_span && !self.causal {
             let b = ((seq as usize) % self.k) as u32;
             self.resolve(b, off);
             return;
         }
 
-        frame_indices_into(&mut self.idx, &mut self.idx_scratch, &self.cdf, self.session_id, seq);
+        if (seq as usize) < self.sys_span {
+            self.idx.clear();
+            if seq != 0 {
+                self.idx.push(seq - 1);
+            }
+            self.idx.push(seq);
+        } else {
+            frame_indices_into(
+                &mut self.idx,
+                &mut self.idx_scratch,
+                &self.cdf,
+                self.session_id,
+                seq,
+            );
+        }
         let mut unsolved = Vec::with_capacity(8);
         for &b in self.idx.iter() {
             match self.solved[b as usize] {
@@ -485,4 +573,24 @@ impl LtDecoder {
         }
         Some(out)
     }
+}
+
+fn checked_encoder_k(payload: &[u8], block_len: usize) -> Result<usize> {
+    if payload.is_empty() {
+        return Err(Error::Empty);
+    }
+    if block_len == 0 || block_len > u16::MAX as usize {
+        return Err(Error::InvalidStream);
+    }
+    if payload.len() as u64 > MAX_STREAM_BYTES {
+        return Err(Error::TooLarge {
+            len: payload.len() as u64,
+            max: MAX_STREAM_BYTES,
+        });
+    }
+    let k = payload.len().div_ceil(block_len);
+    if k == 0 || k > MAX_SOURCE_BLOCKS {
+        return Err(Error::InvalidStream);
+    }
+    Ok(k)
 }

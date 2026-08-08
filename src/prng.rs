@@ -36,10 +36,8 @@ impl Iterator for SplitMix32 {
 
 #[inline]
 pub fn frame_seed(session_id: u32, seq: u32) -> u32 {
-    let mut h = session_id
-        .wrapping_add(1)
-        .wrapping_mul(0x9e37_79b1)
-        ^ seq.wrapping_add(0x85eb_ca6b);
+    let mut h =
+        session_id.wrapping_add(1).wrapping_mul(0x9e37_79b1) ^ seq.wrapping_add(0x85eb_ca6b);
     h = (h ^ (h >> 13)).wrapping_mul(0xc2b2_ae35);
     h ^ (h >> 16)
 }

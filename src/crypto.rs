@@ -14,8 +14,19 @@ impl EncryptionKey {
         Self(bytes)
     }
 
-    pub fn from_password(password: &[u8]) -> Self {
-        Self(blake3::derive_key("deopti-transfer container v2", password))
+    #[cfg(feature = "encryption")]
+    pub fn from_password(password: &[u8], salt: &[u8; NONCE_LEN]) -> Result<Self> {
+        use argon2::{Algorithm, Argon2, Params, Version};
+
+        const MEMORY_KIB: u32 = 19 * 1024;
+        const ITERATIONS: u32 = 2;
+        let params = Params::new(MEMORY_KIB, ITERATIONS, 1, Some(32)).map_err(|_| Error::Crypto)?;
+        let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let mut key = [0u8; 32];
+        argon
+            .hash_password_into(password, salt, &mut key)
+            .map_err(|_| Error::Crypto)?;
+        Ok(Self(key))
     }
 
     #[cfg(feature = "encryption")]
@@ -30,6 +41,14 @@ impl Clone for EncryptionKey {
     }
 }
 
+#[cfg(feature = "encryption")]
+impl Drop for EncryptionKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
+
 impl core::fmt::Debug for EncryptionKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("EncryptionKey([redacted])")
@@ -37,10 +56,10 @@ impl core::fmt::Debug for EncryptionKey {
 }
 
 #[cfg(all(feature = "encryption", feature = "std"))]
-pub fn random_nonce() -> [u8; NONCE_LEN] {
+pub fn random_nonce() -> Result<[u8; NONCE_LEN]> {
     let mut n = [0u8; NONCE_LEN];
-    getrandom::fill(&mut n).expect("OS randomness unavailable");
-    n
+    getrandom::fill(&mut n).map_err(|_| Error::Crypto)?;
+    Ok(n)
 }
 
 #[cfg(feature = "encryption")]
@@ -52,10 +71,17 @@ pub fn encrypt(
 ) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::{Aead, Payload};
     use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
-    let n = XNonce::from_slice(nonce);
+    let key = Key::from(*key);
+    let cipher = XChaCha20Poly1305::new(&key);
+    let n = XNonce::from(*nonce);
     cipher
-        .encrypt(n, Payload { msg: plaintext, aad })
+        .encrypt(
+            &n,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| Error::Crypto)
 }
 
@@ -68,9 +94,16 @@ pub fn decrypt(
 ) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::{Aead, Payload};
     use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
-    let n = XNonce::from_slice(nonce);
+    let key = Key::from(*key);
+    let cipher = XChaCha20Poly1305::new(&key);
+    let n = XNonce::from(*nonce);
     cipher
-        .decrypt(n, Payload { msg: ciphertext, aad })
+        .decrypt(
+            &n,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| Error::Crypto)
 }
