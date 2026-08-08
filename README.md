@@ -331,7 +331,7 @@ optional `flate2` / `argon2` / `chacha20poly1305` / `getrandom` / `zeroize`.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache-2.0. See [LICENSE](LICENSE).
 
 ---
 
@@ -635,4 +635,4 @@ cargo build --release --no-default-features --features encryption
 
 ## 许可证
 
-Apache-2.0。见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。
+Apache-2.0。见 [LICENSE](LICENSE)。
