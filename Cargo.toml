@@ -1,0 +1,50 @@
+[package]
+name = "deopti_transfer"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/blueokanna/DeOptiTransfer"
+readme = "README.md"
+description = "The no_std LT Fountain Code Core for Unidirectional Optical Data Transfer. A bit-exact, zero-handshake engine enabling reliable screen-to-camera file transmission over visual channels."
+keywords = ["fountain", "lt-code", "qr", "optical", "transfer", "no-std"]
+categories = ["encoding", "compression", "cryptography", "no-std"]
+
+[features]
+default = ["std"]
+std = ["dep:flate2"]
+encryption = ["dep:chacha20poly1305", "dep:getrandom"]
+
+[dependencies]
+rustbinary = { version = "0.1.4", default-features = false, features = [
+    "alloc",
+] }
+serde = { version = "1", default-features = false, features = [
+    "derive",
+    "alloc",
+] }
+blake3 = { version = "1.8.6", default-features = false }
+libm = "0.2"
+chacha20poly1305 = { version = "0.11", default-features = false, features = [
+    "alloc",
+], optional = true }
+getrandom = { version = "0.4", default-features = false, optional = true }
+flate2 = { version = "1.1.9", default-features = false, features = [
+    "rust_backend",
+], optional = true }
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "bench"
+harness = false
+
+[profile.bench]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

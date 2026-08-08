@@ -1,0 +1,421 @@
+﻿use deopti_transfer::container::{is_precompressed_type, pack_file, unpack_file, verify_file, Compression};
+use deopti_transfer::fountain::{LtDecoder, LtEncoder};
+use deopti_transfer::prng::SplitMix32;
+use deopti_transfer::session::{Receiver, Sender};
+use deopti_transfer::Error;
+
+fn test_payload(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| ((i * 37 + (i >> 8) * 11) & 0xff) as u8)
+        .collect()
+}
+
+struct RoundTrip {
+    overhead: f64,
+    recovered: Option<Vec<u8>>,
+}
+
+fn round_trip(byte_length: usize, block_len: usize, session_id: u32, drop_rate: f64) -> RoundTrip {
+    let payload = test_payload(byte_length);
+    let mut encoder = LtEncoder::new(&payload, block_len, session_id);
+    let k = encoder.k();
+    let mut decoder = LtDecoder::new(k, block_len, session_id, byte_length);
+    let mut rnd = SplitMix32::new(session_id);
+    let mut seq = 0u32;
+    let ceiling = (k * 80 + 5000) as u32;
+    while !decoder.is_complete() && seq < ceiling {
+        let u = rnd.next_u32() as f64 / 4_294_967_296.0;
+        if u >= drop_rate {
+            decoder.add_frame(seq, &encoder.encode(seq));
+        }
+        seq += 1;
+    }
+    RoundTrip {
+        overhead: decoder.frames_new() as f64 / k as f64,
+        recovered: decoder.assemble(),
+    }
+}
+
+#[test]
+fn payload_survives_the_fountain() {
+    for (byte_length, block_len) in [
+        (7usize, 2933usize),
+        (2933, 2933),
+        (50_000, 1445),
+        (512 * 1024, 2933),
+        (2 * 1024 * 1024, 2933),
+    ] {
+        let rt = round_trip(byte_length, block_len, 11, 0.0);
+        assert_eq!(rt.recovered, Some(test_payload(byte_length)), "{byte_length}B");
+    }
+}
+
+#[test]
+fn dropping_30_percent_costs_time_never_correctness() {
+    let rt = round_trip(512 * 1024, 2933, 23, 0.3);
+    assert_eq!(rt.recovered, Some(test_payload(512 * 1024)));
+    assert!(rt.overhead < 1.6, "overhead {:.2} too high", rt.overhead);
+}
+
+#[test]
+fn duplicates_are_counted_but_harmless() {
+    let byte_length = 60_000;
+    let payload = test_payload(byte_length);
+    let mut encoder = LtEncoder::new(&payload, 1445, 31);
+    let mut decoder = LtDecoder::new(encoder.k(), 1445, 31, byte_length);
+    let mut seq = 0u32;
+    while !decoder.is_complete() {
+        let frame = encoder.encode(seq);
+        decoder.add_frame(seq, &frame);
+        decoder.add_frame(seq, &frame);
+        seq += 1;
+    }
+    assert!(decoder.frames_dup() >= decoder.frames_new() - 1);
+    assert_eq!(decoder.assemble(), Some(payload));
+}
+
+#[test]
+fn session_end_to_end_with_loss() {
+    let original = b"decimen optical transfer\n".repeat(2000);
+    let packed = pack_file("notes.txt", "text/plain", &original).expect("pack");
+    assert_eq!(packed.compression, Compression::Gzip);
+    let mut sender = Sender::from_packed(&packed, 1465, 0x0c_d1);
+    let mut receiver = Receiver::new();
+    let mut rnd = SplitMix32::new(0xdead_beef);
+    let mut recovered = None;
+    for _ in 0..sender.k() as usize * 80 {
+        if rnd.next_u32() as f64 / 4_294_967_296.0 >= 0.15 {
+            let frame = sender.next_frame();
+            if let Some(container) = receiver.push(&frame.to_bytes()) {
+                recovered = Some(container);
+                break;
+            }
+        }
+    }
+    let container = recovered.expect("stream completed");
+    assert_eq!(container, packed.container);
+    let file = unpack_file(&container).expect("unpack");
+    assert_eq!(file.name, "notes.txt");
+    assert_eq!(file.mime_type, "text/plain");
+    assert_eq!(file.bytes, original);
+    assert!(verify_file(&file));
+}
+
+#[test]
+fn receiver_resets_on_new_stream_identity() {
+    let payload = test_payload(20_000);
+    let mut a = Sender::new(&payload, 1445, 0x1111);
+    let mut b = Sender::new(&payload, 1445, 0x2222);
+    let mut receiver = Receiver::new();
+    let _ = receiver.push(&a.next_frame().to_bytes());
+    assert!(receiver.is_active());
+    let _ = receiver.push(&b.next_frame().to_bytes());
+    let mut out = None;
+    for _ in 0..200 {
+        if let Some(c) = receiver.push(&b.next_frame().to_bytes()) {
+            out = Some(c);
+            break;
+        }
+    }
+    assert_eq!(out, Some(payload));
+}
+
+#[test]
+fn container_round_trips() {
+    let source = b"decimen optical transfer\n".repeat(4000);
+    let packed = pack_file("notes.txt", "text/plain", &source).unwrap();
+    assert_eq!(packed.compression, Compression::Gzip);
+    let recovered = unpack_file(&packed.container).unwrap();
+    assert_eq!(recovered.bytes, source);
+    assert!(verify_file(&recovered));
+
+    let source2: Vec<u8> = (0..4096)
+        .map(|i| (i as u32).wrapping_mul(2_654_435_761u32) >> 24)
+        .map(|v| v as u8)
+        .collect();
+    let packed2 = pack_file("photo.jpg", "image/jpeg", &source2).unwrap();
+    assert_eq!(packed2.compression, Compression::None);
+    assert_eq!(unpack_file(&packed2.container).unwrap().bytes, source2);
+}
+
+#[test]
+fn container_rejects_malformed_input() {
+    let source = b"bounded output\n".repeat(1000);
+    let packed = pack_file("bounded.txt", "text/plain", &source).unwrap();
+    let mut malformed = packed.container.clone();
+    let orig = source.len() as u32;
+    malformed[9..13].copy_from_slice(&(orig + 1).to_le_bytes());
+    assert!(matches!(unpack_file(&malformed), Err(Error::GzipSize)));
+
+    assert!(matches!(unpack_file(&[0u8; 10]), Err(Error::Truncated)));
+    assert!(matches!(unpack_file(&[0u8; 73]), Err(Error::BadMagic)));
+}
+
+#[test]
+fn names_are_sanitised() {
+    let cases: [(&str, &str); 4] = [
+        ("../../etc/passwd", "passwd"),
+        ("C:\\Windows\\System32\\drivers\\etc\\hosts", "hosts"),
+        ("茅vidence.pdf", "茅vidence.pdf"),
+        ("report v2 (final).tar.gz", "report v2 (final).tar.gz"),
+    ];
+    for (sent, expected) in cases {
+        let packed = pack_file(sent, "application/octet-stream", &[1, 2, 3]).unwrap();
+        assert_eq!(unpack_file(&packed.container).unwrap().name, expected);
+    }
+    for sent in ["..", ".", "/", "   ", "\u{0}\u{7}"] {
+        let packed = pack_file(sent, "application/octet-stream", &[1]).unwrap();
+        assert_eq!(unpack_file(&packed.container).unwrap().name, "transfer.bin");
+    }
+}
+
+#[test]
+fn compression_decision() {
+    for ty in [
+        "image/jpeg",
+        "image/png",
+        "video/mp4",
+        "audio/mpeg",
+        "application/zip",
+        "application/gzip",
+        "application/x-7z-compressed",
+        "application/epub+zip",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "IMAGE/JPEG",
+        "image/jpeg; charset=binary",
+    ] {
+        assert!(is_precompressed_type(ty), "{ty}");
+    }
+    for ty in [
+        "text/plain",
+        "application/json",
+        "application/pdf",
+        "application/octet-stream",
+        "image/svg+xml",
+        "image/bmp",
+        "audio/wav",
+        "",
+    ] {
+        assert!(!is_precompressed_type(ty), "{ty}");
+    }
+}
+
+#[test]
+fn try_new_rejects_inconsistent_stream_headers() {
+    use deopti_transfer::Error;
+    assert!(LtDecoder::try_new(0, 2933, 1, 100).is_err());
+    assert!(LtDecoder::try_new(10, 0, 1, 100).is_err());
+    assert!(LtDecoder::try_new(10, 2933, 1, 0).is_err());
+    assert!(LtDecoder::try_new(9, 2933, 1, 100).is_err(), "k must equal ceil(total/block)");
+    assert!(LtDecoder::try_new(10, 2933, 1, 100).is_err(), "ceil(100/2933)=1 != 10");
+    assert!(LtDecoder::try_new(1, 2933, 1, 100).is_ok(), "single block holds a small payload");
+    assert!(LtDecoder::try_new(10, 2933, 1, 29_330).is_ok());
+    assert!(LtDecoder::try_new(2, 2933, 1, 2933).is_err());
+    assert!(LtDecoder::try_new(2, 2933, 1, 2934).is_ok());
+    let oversized: usize = 64 * 1024 * 1024 + 1;
+    assert!(LtDecoder::try_new(oversized.div_ceil(2933), 2933, 1, oversized).is_err());
+    assert!(matches!(
+        LtDecoder::try_new(oversized.div_ceil(2933), 2933, 1, oversized),
+        Err(Error::TooLarge { .. })
+    ));
+}
+
+#[test]
+fn receiver_ignores_crafted_amplification_frames() {
+    use deopti_transfer::frame::{fnv1a, pack_frame, FrameHeader};
+    let mut receiver = Receiver::new();
+    let wire = pack_frame(
+        &FrameHeader {
+            flags: 0,
+            session_id: 0x0c_d1,
+            seq: 0,
+            k: 65535,
+            block_len: 2933,
+            total_len: 100,
+            payload_fnv: fnv1a(&[0]),
+        },
+        &[0u8; 2933],
+    );
+    assert!(receiver.push(&wire).is_none(), "inconsistent k must not create a decoder");
+    assert!(!receiver.is_active());
+
+    let huge = pack_frame(
+        &FrameHeader {
+            flags: 0,
+            session_id: 0x0c_d1,
+            seq: 0,
+            k: 22_900,
+            block_len: 2933,
+            total_len: 0xffff_ffff,
+            payload_fnv: fnv1a(&[0]),
+        },
+        &[0u8; 2933],
+    );
+    assert!(receiver.push(&huge).is_none(), "oversized total_len must be rejected");
+    assert!(!receiver.is_active());
+}
+
+#[test]
+fn normal_decode_drops_no_frames() {
+    let payload = test_payload(300_000);
+    let mut encoder = LtEncoder::new(&payload, 1445, 55);
+    let mut decoder = LtDecoder::new(encoder.k(), 1445, 55, 300_000);
+    let mut seq = 0u32;
+    while !decoder.is_complete() && seq < 20_000 {
+        decoder.add_frame(seq, &encoder.encode(seq));
+        seq += 1;
+    }
+    assert_eq!(decoder.assemble(), Some(payload));
+    assert_eq!(decoder.frames_dropped(), 0);
+}
+
+#[test]
+fn systematic_phase_completes_in_exactly_k_frames() {
+    let byte_length = 512 * 1024;
+    let block_len = 2933;
+    let payload = test_payload(byte_length);
+    let mut encoder = LtEncoder::new_systematic(&payload, block_len, 9);
+    let k = encoder.k();
+    assert!(k > 1);
+    let mut decoder = LtDecoder::new_systematic(k, block_len, 9, byte_length);
+    for seq in 0..k as u32 {
+        decoder.add_frame(seq, &encoder.encode(seq));
+        assert_eq!(decoder.frames_new(), (seq + 1) as usize);
+    }
+    assert!(decoder.is_complete(), "systematic phase must solve every block");
+    assert_eq!(decoder.assemble(), Some(payload));
+}
+
+#[test]
+fn systematic_phase_survives_loss() {
+    let byte_length = 100_000;
+    let block_len = 1445;
+    let payload = test_payload(byte_length);
+    let mut encoder = LtEncoder::new_systematic(&payload, block_len, 23);
+    let k = encoder.k();
+    let mut decoder = LtDecoder::new_systematic(k, block_len, 23, byte_length);
+    let mut rnd = SplitMix32::new(0x5eed);
+    let mut seq = 0u32;
+    let ceiling = (k * 80 + 5000) as u32;
+    while !decoder.is_complete() && seq < ceiling {
+        let u = rnd.next_u32() as f64 / 4_294_967_296.0;
+        if u >= 0.3 {
+            decoder.add_frame(seq, &encoder.encode(seq));
+        }
+        seq += 1;
+    }
+    assert_eq!(decoder.assemble(), Some(payload));
+    assert!((decoder.frames_new() as f64 / k as f64) < 1.6);
+}
+
+#[test]
+fn receiver_locking_on_after_systematic_phase_still_decodes() {
+    let byte_length = 100_000;
+    let block_len = 1445;
+    let payload = test_payload(byte_length);
+    let mut encoder = LtEncoder::new_systematic(&payload, block_len, 77);
+    let k = encoder.k();
+    let mut decoder = LtDecoder::new_systematic(k, block_len, 77, byte_length);
+    let mut seq = k as u32;
+    let ceiling = (k as u32) * 80 + 5000;
+    while !decoder.is_complete() && seq < ceiling {
+        decoder.add_frame(seq, &encoder.encode(seq));
+        seq += 1;
+    }
+    assert!(decoder.is_complete(), "coded phase alone must complete");
+    assert_eq!(decoder.assemble(), Some(payload));
+}
+
+#[test]
+fn systematic_reduces_frames_needed_under_loss() {
+    // Per-seq deterministic drop mask: all decoders see identical drops per seq.
+    let drop = |seq: u32, rate: f64| {
+        let u = SplitMix32::new(seq ^ 0x5eed_1234).next_u32() as f64 / 4_294_967_296.0;
+        u < rate
+    };
+    let byte_length = 200_000;
+    let block_len = 1445;
+    let payload = test_payload(byte_length);
+    let mut enc_rsd = LtEncoder::new(&payload, block_len, 31337);
+    let mut enc_sys = LtEncoder::new_systematic(&payload, block_len, 31337);
+    let k = enc_rsd.k();
+    assert_eq!(enc_sys.k(), k);
+    for &rate in &[0.0f64, 0.1, 0.3] {
+        let measure = |encoder: &mut LtEncoder, decoder: &mut LtDecoder| {
+            let mut seq = 0u32;
+            let ceiling = (k as u32) * 200 + 10_000;
+            while !decoder.is_complete() && seq < ceiling {
+                if !drop(seq, rate) {
+                    decoder.add_frame(seq, &encoder.encode(seq));
+                }
+                seq += 1;
+            }
+            assert_eq!(decoder.assemble(), Some(payload.clone()));
+            decoder.frames_new()
+        };
+        let mut pure = LtDecoder::new(k, block_len, 31337, byte_length);
+        let pure_frames = measure(&mut enc_rsd, &mut pure);
+        let mut sys1 = LtDecoder::new_systematic(k, block_len, 31337, byte_length);
+        let sys1_frames = measure(&mut enc_sys, &mut sys1);
+        if rate == 0.0 {
+            assert_eq!(sys1_frames, k, "zero-loss single systematic must need exactly k frames");
+            assert!(sys1_frames <= pure_frames, "systematic must beat pure RSD at zero loss");
+        } else {
+            assert!((sys1_frames as f64) < k as f64 * 1.6, "systematic decode must still complete");
+        }
+        println!(
+            "overhead rate={:.0}% pure={:.3} sys1={:.3}",
+            rate * 100.0,
+            pure_frames as f64 / k as f64,
+            sys1_frames as f64 / k as f64,
+        );
+    }
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn encrypted_container_round_trips_and_verifies() {
+    use deopti_transfer::container::pack_file_encrypted;
+    use deopti_transfer::container::unpack_file_with_key;
+    use deopti_transfer::crypto::EncryptionKey;
+    let key = EncryptionKey::from_password(b"correct horse battery staple");
+    let nonce = [0x42u8; 24];
+    let source = b"decimen optical transfer\n".repeat(4000);
+    let packed = pack_file_encrypted("notes.txt", "text/plain", &source, &key, &nonce).unwrap();
+    assert!(packed.encrypted);
+    let file = unpack_file_with_key(&packed.container, &key).unwrap();
+    assert!(file.encrypted);
+    assert_eq!(file.name, "notes.txt");
+    assert_eq!(file.bytes, source);
+    assert!(verify_file(&file));
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn encrypted_container_rejects_wrong_key_and_tampering() {
+    use deopti_transfer::container::{pack_file_encrypted, unpack_file_with_key};
+    use deopti_transfer::crypto::EncryptionKey;
+    let key = EncryptionKey::from_password(b"correct horse battery staple");
+    let wrong = EncryptionKey::from_password(b"wrong password");
+    let nonce = [0x42u8; 24];
+    let source = b"top secret payload\n".repeat(1000);
+    let packed = pack_file_encrypted("secret.txt", "text/plain", &source, &key, &nonce).unwrap();
+    assert!(matches!(unpack_file_with_key(&packed.container, &wrong), Err(Error::Crypto)));
+
+    let mut tampered = packed.container.clone();
+    let n = tampered.len();
+    tampered[n - 1] ^= 0xff;
+    assert!(matches!(unpack_file_with_key(&tampered, &key), Err(Error::Crypto)));
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn encrypted_container_without_key_is_rejected() {
+    use deopti_transfer::container::pack_file_encrypted;
+    use deopti_transfer::crypto::EncryptionKey;
+    let key = EncryptionKey::from_password(b"secret");
+    let packed = pack_file_encrypted("s.txt", "text/plain", b"data", &key, &[1u8; 24]).unwrap();
+    assert!(matches!(unpack_file(&packed.container), Err(Error::NoEncryption)));
+}
+
+
