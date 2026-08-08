@@ -18,7 +18,9 @@ fn readme_plain_transfer_example() {
     assert_eq!(file.bytes, b"hello over light");
 }
 
-#[cfg(feature = "encryption")]
+// The README encryption quick start uses `random_nonce`, which is gated on
+// both `encryption` and `std`; under no_std the caller supplies its own nonce.
+#[cfg(all(feature = "encryption", feature = "std"))]
 #[test]
 fn readme_encrypted_transfer_example() {
     use deopti_transfer::container::unpack_file_with_password;
@@ -33,6 +35,7 @@ fn readme_encrypted_transfer_example() {
         &nonce,
     )
     .unwrap();
-    let file = unpack_file_with_password(&packed.container, b"correct horse battery staple").unwrap();
+    let file =
+        unpack_file_with_password(&packed.container, b"correct horse battery staple").unwrap();
     assert_eq!(file.bytes, b"top secret");
 }

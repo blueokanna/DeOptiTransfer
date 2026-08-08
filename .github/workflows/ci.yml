@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Formatting: fail fast on style drift.
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+  # ---------------------------------------------------------------------------
+  # Lint: every supported feature configuration, warnings as errors.
+  # All three configs are part of the crate's published surface:
+  #   default (std + gzip), pure no_std, and no_std + encryption.
+  # `--all-targets` also compiles the integration-test targets, so the
+  # no_std configs get compile coverage for tests without running them
+  # (no_std test runs are intentionally not part of CI).
+  # ---------------------------------------------------------------------------
+  clippy:
+    name: clippy (${{ matrix.config.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        config:
+          - name: all-features
+            args: --all-features --all-targets
+          - name: no-default
+            args: --no-default-features --all-targets
+          - name: no-default+encryption
+            args: --no-default-features --features encryption --all-targets
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (${{ matrix.config.name }})
+        run: cargo clippy ${{ matrix.config.args }} -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # Tests: cross-platform behavior check. Golden vectors are deterministic
+  # (BLAKE3/FNV fingerprints) and SIMD dispatch falls back to scalar, so the
+  # same suite must pass on x86_64 and aarch64 runners alike.
+  # ---------------------------------------------------------------------------
+  test:
+    name: test (${{ matrix.os }} / ${{ matrix.features.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        features:
+          - name: default
+            args: ""
+          - name: all-features
+            args: --all-features
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (${{ matrix.features.name }})
+        run: cargo test ${{ matrix.features.args }}
+
+  # ---------------------------------------------------------------------------
+  # Docs: rustdoc must build with zero warnings (docs.rs visibility gate).
+  # ---------------------------------------------------------------------------
+  doc:
+    name: doc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: rustdoc
+        run: cargo doc --no-deps --all-features
+
+  # ---------------------------------------------------------------------------
+  # Release builds: all three supported configs on all three OSes.
+  # This is what actually proves no_std (and no_std + encryption) ships.
+  # ---------------------------------------------------------------------------
+  build-release:
+    name: build-release (${{ matrix.os }} / ${{ matrix.features.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        features:
+          - name: default
+            args: ""
+          - name: no-default
+            args: --no-default-features
+          - name: no-default+encryption
+            args: --no-default-features --features encryption
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release (${{ matrix.features.name }})
+        run: cargo build --release ${{ matrix.features.args }}
+
+  # ---------------------------------------------------------------------------
+  # Package: crates.io publish readiness. `--allow-dirty` is required because
+  # Cargo.lock is gitignored and `cargo package` regenerates it during the
+  # verification build.
+  # ---------------------------------------------------------------------------
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo package
+        run: cargo package --allow-dirty
+
+  # ---------------------------------------------------------------------------
+  # Benchmarks: criterion suite (~6 min). Kept out of PR/push to avoid
+  # runner-to-runner noise; run on demand via workflow_dispatch.
+  # ---------------------------------------------------------------------------
+  bench:
+    name: bench
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: criterion
+        run: cargo bench
