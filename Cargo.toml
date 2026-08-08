@@ -6,7 +6,7 @@ license = "Apache-2.0"
 repository = "https://github.com/blueokanna/DeOptiTransfer"
 readme = "README.md"
 description = "The no_std LT Fountain Code Core for Unidirectional Optical Data Transfer. A bit-exact, zero-handshake engine enabling reliable screen-to-camera file transmission over visual channels."
-keywords = ["fountain", "lt-code", "qr", "optical", "transfer", "no-std"]
+keywords = ["fountain", "lt-code", "qr", "optical", "transfer"]
 categories = ["encoding", "compression", "cryptography", "no-std"]
 
 [features]
