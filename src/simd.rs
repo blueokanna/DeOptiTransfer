@@ -1,3 +1,9 @@
+//! Runtime-dispatched SIMD XOR engine.
+//!
+//! [`xor_into`] uses AVX2 (verified via `__cpuid` + `_xgetbv`), SSE2 on
+//! x86_64, NEON on aarch64, and a scalar fallback — all through
+//! `core::arch`, so it works in no_std.
+
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
@@ -19,6 +25,8 @@ fn avx2_available() -> bool {
     info7.ebx & (1 << 5) != 0
 }
 
+/// XOR `src` into `dst` in place, using the fastest SIMD path available on
+/// the current CPU (AVX2, SSE2, NEON, or scalar).
 pub fn xor_into(dst: &mut [u32], src: &[u32]) {
     debug_assert_eq!(dst.len(), src.len());
     #[cfg(target_arch = "x86_64")]

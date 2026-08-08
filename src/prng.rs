@@ -1,3 +1,7 @@
+//! Deterministic wire-format PRNG: [`SplitMix32`] and [`frame_seed`].
+//! Integer-only, so it is bit-identical on every target.
+
+/// splitmix32: the wire-format PRNG. Integer-only, bit-identical everywhere.
 pub struct SplitMix32 {
     state: u32,
 }
@@ -34,6 +38,8 @@ impl Iterator for SplitMix32 {
     }
 }
 
+/// Derive the per-frame PRNG seed from the session and sequence number.
+/// Mixing both means a fresh session reshuffles the whole stream.
 #[inline]
 pub fn frame_seed(session_id: u32, seq: u32) -> u32 {
     let mut h =

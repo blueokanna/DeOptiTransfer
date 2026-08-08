@@ -1,3 +1,25 @@
+//! Protocol v3 frame format and integrity.
+//!
+//! Every frame is fully self-describing (no handshake): a 25-byte
+//! little-endian header followed by the `block_len` payload bytes.
+//!
+//! ```text
+//!  0  2 bytes  magic        D1 0F
+//!  2  u8       flags        bit0 direct-systematic, bit1 causal
+//!  3  u16      session_id   random per sender start
+//!  5  u32      seq
+//!  9  u16      k            source block count
+//! 11  u16      block_len    payload bytes per frame
+//! 13  u32      total_len    protected container length
+//! 17  u32      stream_tag   BLAKE3 tag of the whole container
+//! 21  u32      frame_tag    BLAKE3 tag of this header + block
+//! ```
+//!
+//! [`parse_frame`] verifies `frame_tag` before a frame reaches the decoder,
+//! so a damaged frame becomes an erasure instead of a poisoned equation. A
+//! receiver locks to the first [`StreamIdentity`]; frames from any other
+//! stream are rejected by the [`session`](crate::session) layer.
+
 use alloc::vec::Vec;
 use rustbinary::Config;
 use serde::{Deserialize, Serialize};
@@ -17,18 +39,34 @@ const CFG: Config = Config::legacy()
     .reject_trailing_bytes()
     .with_limit(32);
 
+/// The fixed, self-describing fields of a protocol-v3 frame.
+///
+/// Serialized little-endian (2 magic bytes are prepended by
+/// [`pack_frame`]); every field except `seq` is constant across a stream and
+/// together they form the stream's [`StreamIdentity`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrameHeader {
+    /// Mode bits: `FLAG_SYSTEMATIC` (direct systematic) or `FLAG_CAUSAL`
+    /// (causal weave); the receiver adapts to whichever is set.
     pub flags: u8,
+    /// Random per sender start; mixed into the fountain PRNG seed.
     pub session_id: u16,
+    /// Sequence number; drives the fountain / weave.
     pub seq: u32,
+    /// Source block count.
     pub k: u16,
+    /// Payload bytes per frame.
     pub block_len: u16,
+    /// Protected container length in bytes.
     pub total_len: u32,
+    /// BLAKE3-derived tag identifying the whole transmitted container.
     pub stream_tag: u32,
+    /// BLAKE3-derived tag over this header and block, verified on arrival.
     pub frame_tag: u32,
 }
 
+/// Everything about a frame that must hold constant for a decoder to keep
+/// accepting frames into it. `seq` is deliberately absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamIdentity {
     pub flags: u8,
@@ -39,6 +77,8 @@ pub struct StreamIdentity {
     pub stream_tag: u32,
 }
 
+/// Serialize a frame: the 25-byte header (with magic prefix) followed by
+/// `block`.
 pub fn pack_frame(h: &FrameHeader, block: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + block.len());
     out.push(MAGIC0);
@@ -48,6 +88,10 @@ pub fn pack_frame(h: &FrameHeader, block: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Parse and integrity-check a frame.
+///
+/// Returns `None` for wrong magic, inconsistent fields, or a `frame_tag`
+/// mismatch — a damaged frame is an erasure, never a poisoned equation.
 pub fn parse_frame(bytes: &[u8]) -> Option<(FrameHeader, &[u8])> {
     if bytes.len() <= HEADER_LEN || bytes[0] != MAGIC0 || bytes[1] != MAGIC1 {
         return None;
@@ -71,6 +115,7 @@ pub fn parse_frame(bytes: &[u8]) -> Option<(FrameHeader, &[u8])> {
     Some((h, block))
 }
 
+/// Project a frame header onto its constant stream identity.
 pub const fn stream_identity(h: &FrameHeader) -> StreamIdentity {
     StreamIdentity {
         flags: h.flags,

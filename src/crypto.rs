@@ -1,3 +1,10 @@
+//! Authenticated encryption primitives (feature `encryption`).
+//!
+//! [`EncryptionKey`] is a 32-byte key (zeroized on drop) derived from a
+//! password with Argon2id, or supplied directly. Containers are sealed with
+//! XChaCha20-Poly1305; the nonce doubles as the Argon2 salt, so a fresh
+//! nonce yields a fresh key.
+
 #[cfg(feature = "encryption")]
 use alloc::vec::Vec;
 
@@ -7,6 +14,10 @@ use crate::error::{Error, Result};
 pub const NONCE_LEN: usize = 24;
 pub const TAG_LEN: usize = 16;
 
+/// A 32-byte authenticated-encryption key.
+///
+/// `Debug` is redacted and, with the `encryption` feature, the key material
+/// is zeroized on drop.
 pub struct EncryptionKey([u8; 32]);
 
 impl EncryptionKey {
@@ -14,6 +25,9 @@ impl EncryptionKey {
         Self(bytes)
     }
 
+    /// Derive a key from a password with Argon2id (19 MiB, 2 iterations).
+    ///
+    /// The 24-byte salt is the AEAD nonce: a fresh nonce yields a fresh key.
     #[cfg(feature = "encryption")]
     pub fn from_password(password: &[u8], salt: &[u8; NONCE_LEN]) -> Result<Self> {
         use argon2::{Algorithm, Argon2, Params, Version};
@@ -55,6 +69,8 @@ impl core::fmt::Debug for EncryptionKey {
     }
 }
 
+/// Draw a fresh 24-byte nonce from the operating system's RNG (std builds).
+/// no_std applications supply their own (e.g., from an embedded TRNG).
 #[cfg(all(feature = "encryption", feature = "std"))]
 pub fn random_nonce() -> Result<[u8; NONCE_LEN]> {
     let mut n = [0u8; NONCE_LEN];

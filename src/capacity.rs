@@ -1,8 +1,13 @@
+//! Frame-capacity arithmetic: how much payload fits in one stream at a given
+//! frame size, given that `k` is a `u16` on the wire.
+
 use crate::frame::HEADER_LEN;
 
 pub const MAX_SOURCE_BLOCKS: usize = 0xffff;
 
 #[inline]
+/// Payload bytes per frame, once the header has taken its cut.
+/// `None` when `frame_bytes` is too small to hold the header.
 pub fn block_length(frame_bytes: usize) -> Option<usize> {
     frame_bytes
         .checked_sub(HEADER_LEN)
@@ -10,6 +15,8 @@ pub fn block_length(frame_bytes: usize) -> Option<usize> {
 }
 
 #[inline]
+/// Source blocks a payload splits into at this frame size.
+/// `None` when the frame size is too small.
 pub fn source_block_count(payload_bytes: usize, frame_bytes: usize) -> Option<usize> {
     let block_len = block_length(frame_bytes)?;
     Some(payload_bytes.div_ceil(block_len))

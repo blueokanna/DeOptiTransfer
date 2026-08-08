@@ -1,3 +1,5 @@
+//! The crate error type and result alias.
+
 use alloc::string::String;
 use core::fmt;
 

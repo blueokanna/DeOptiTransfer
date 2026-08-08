@@ -1,9 +1,19 @@
+//! A zero-dependency open-addressing `u32` set.
+//!
+//! The hash `v·0x9E3779B1 mod 2^t` is a bijection on the low bits, so any
+//! run of consecutive keys (fountain sequence numbers) never collides.
+
 use alloc::vec;
 use alloc::vec::Vec;
 
 const LOAD_NUM: usize = 7;
 const LOAD_DEN: usize = 10;
 
+/// An open-addressing set of `u32` keys with no external dependencies.
+///
+/// The multiplicative hash is a bijection on the low bits, so consecutive
+/// keys (fountain sequence numbers) never collide; occupancy is packed into
+/// a bit vector; the table rehashes at 0.7 load.
 pub struct U32Set {
     keys: Vec<u32>,
     occ: Vec<u64>,

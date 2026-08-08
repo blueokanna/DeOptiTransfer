@@ -1,3 +1,12 @@
+//! The fountain codec: causal weave, direct systematic, and pure robust
+//! soliton modes.
+//!
+//! [`LtEncoder`] streams frames for `seq = 0, 1, 2, ...`; [`LtDecoder`]
+//! peels the payload out of any ~K·1.15 distinct frames. The causal weave
+//! first phase (`y[0] = x[0]`, `y[i] = x[i-1] ^ x[i]`) reconstructs the
+//! payload in exactly K frames at zero loss. Both sides derive every block
+//! subset deterministically, so the stream is pinned by golden-vector tests.
+
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -71,6 +80,8 @@ fn select_blocks(
     }
 }
 
+/// Fountain encoder: streams `seq`-derived frames of exactly `block_len`
+/// bytes each, in causal-weave, direct-systematic, or pure-RSD mode.
 pub struct LtEncoder {
     k: usize,
     block_len: usize,
@@ -306,6 +317,9 @@ fn xor_at(arena: &mut [u32], a: usize, b: usize, words: usize) {
     }
 }
 
+/// Fountain decoder: feeds on any distinct frames, in any order, and peels
+/// the payload out once enough have arrived. Uses a flat word arena (no
+/// per-frame heap allocation) and a bijective-hash dedup set.
 pub struct LtDecoder {
     k: usize,
     block_len: usize,

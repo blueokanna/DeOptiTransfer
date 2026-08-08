@@ -1,3 +1,12 @@
+//! The DCF3 file container: filename + media type + bytes + BLAKE3 digest,
+//! with gzip and optional authenticated encryption.
+//!
+//! [`pack_file`] / [`unpack_file`] are the plain path;
+//! [`pack_file_encrypted`] / [`unpack_file_with_key`] add
+//! XChaCha20-Poly1305 AEAD (feature `encryption`). Every length field from
+//! the wire is validated, gzip inflate is hard-bounded, and filenames are
+//! sanitised on receipt.
+
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use rustbinary::Config;
@@ -65,6 +74,11 @@ struct Header {
     nonce: [u8; NONCE_LEN],
 }
 
+/// Pack a file into a self-describing DCF3 container.
+///
+/// gzip is applied only when it wins by a margin and the media type is not
+/// already compressed. Returns `Error::Empty` / `Error::TooLarge` for
+/// out-of-range inputs.
 pub fn pack_file(name: &str, mime_type: &str, bytes: &[u8]) -> Result<PackedOpticalFile> {
     let (name_bytes, type_bytes, plain, compression, digest) = prepare(name, mime_type, bytes)?;
     let flags = if compression == Compression::Gzip {
@@ -217,6 +231,11 @@ fn assemble(
     Ok(container)
 }
 
+/// Unpack and verify a DCF3 container, recovering the original file.
+///
+/// Every field is validated before use; gzip inflate is hard-bounded. An
+/// encrypted container requires `unpack_file_with_key` (or the password
+/// variant) and returns `Error::NoEncryption` here.
 pub fn unpack_file(container: &[u8]) -> Result<OpticalFile> {
     unpack_impl(container, None)
 }

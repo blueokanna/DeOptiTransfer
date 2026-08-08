@@ -1,3 +1,12 @@
+//! High-level middleware: [`Sender`] emits self-contained frames,
+//! [`Receiver`] reconstructs the stream.
+//!
+//! The sender chooses a transmission mode (causal weave by default, direct
+//! systematic, or pure RSD); the frame header's flags carry the mode, so the
+//! receiver adapts automatically. [`Receiver::try_push`] validates each
+//! frame tag, isolates the stream identity, and returns the recovered
+//! container exactly once.
+
 use alloc::vec::Vec;
 
 use crate::capacity::source_block_count;
@@ -9,6 +18,11 @@ use crate::frame::{
     StreamIdentity, FLAG_CAUSAL, FLAG_SYSTEMATIC, HEADER_LEN, MAX_STREAM_BYTES,
 };
 
+/// A fountain sender: wraps the codec and emits fully self-contained frames.
+///
+/// The default mode is the causal weave; `new_systematic` and `new_rsd`
+/// select direct systematic and pure robust-soliton modes. The frame header
+/// carries the mode, so the receiver adapts automatically.
 pub struct Sender {
     encoder: LtEncoder,
     seq: u32,
@@ -153,6 +167,7 @@ impl Sender {
     }
 }
 
+/// One emitted frame: a self-describing header plus its payload block.
 pub struct Frame {
     pub header: FrameHeader,
     pub block: Vec<u8>,
@@ -164,6 +179,8 @@ impl Frame {
     }
 }
 
+/// A fountain receiver: locks to one stream identity, validates every frame
+/// tag, and reconstructs the container exactly once.
 pub struct Receiver {
     decoder: Option<LtDecoder>,
     identity: Option<StreamIdentity>,

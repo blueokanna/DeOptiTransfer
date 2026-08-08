@@ -1,3 +1,7 @@
+//! Deterministic natural logarithm, bit-exact with the reference
+//! implementation and pinned by golden-vector tests. Wire format: sender and
+//! receiver must derive identical degree distributions.
+
 use core::f64::consts::LN_2;
 
 pub fn dlog(x: f64) -> f64 {
