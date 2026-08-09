@@ -14,6 +14,7 @@ pub enum Error {
     Compression(u8),
     Lengths,
     InvalidStream,
+    ResourceLimit,
     InvalidFrameSize { actual: usize, expected: usize },
     SequenceExhausted,
     CorruptFrame,
@@ -24,6 +25,8 @@ pub enum Error {
     Codec { msg: String },
     NoCompression,
     NoEncryption,
+    InvalidKey,
+    InvalidProof,
     Crypto,
 }
 
@@ -38,6 +41,7 @@ impl fmt::Display for Error {
             Error::Compression(m) => write!(f, "unsupported compression {m}"),
             Error::Lengths => write!(f, "length mismatch"),
             Error::InvalidStream => write!(f, "inconsistent stream header"),
+            Error::ResourceLimit => write!(f, "stream exceeds configured receiver limits"),
             Error::InvalidFrameSize { actual, expected } => {
                 write!(f, "invalid frame size {actual}, expected {expected}")
             }
@@ -50,6 +54,8 @@ impl fmt::Display for Error {
             Error::Codec { msg } => write!(f, "codec: {msg}"),
             Error::NoCompression => write!(f, "compression disabled in no_std build"),
             Error::NoEncryption => write!(f, "encryption disabled in this build"),
+            Error::InvalidKey => write!(f, "invalid or non-contributory public key"),
+            Error::InvalidProof => write!(f, "relation proof verification failed"),
             Error::Crypto => write!(f, "authenticated decryption failed"),
         }
     }

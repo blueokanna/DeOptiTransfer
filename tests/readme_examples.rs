@@ -39,3 +39,20 @@ fn readme_encrypted_transfer_example() {
         unpack_file_with_password(&packed.container, b"correct horse battery staple").unwrap();
     assert_eq!(file.bytes, b"top secret");
 }
+
+// The README judge-recoverable quick start (JRC mode).
+#[cfg(all(feature = "encryption", feature = "std"))]
+#[test]
+fn readme_jrc_transfer_example() {
+    use deopti_transfer::crypto::random_nonce;
+    use deopti_transfer::jrc::keygen;
+    use deopti_transfer::{pack_file_jrc, unpack_file_jrc};
+
+    let judge = keygen().unwrap(); // (ek, dk)
+    let nonce = random_nonce().unwrap();
+    let packed =
+        pack_file_jrc("secret.txt", "text/plain", b"top secret", &judge.ek, &nonce).unwrap();
+    // ... transmit `packed.envelope` through a Sender / Receiver ...
+    let file = unpack_file_jrc(&packed.envelope, &judge.dk).unwrap(); // judge-only recovery
+    assert_eq!(file.bytes, b"top secret");
+}

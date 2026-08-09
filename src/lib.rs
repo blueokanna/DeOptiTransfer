@@ -1,36 +1,19 @@
 //! # deopti-transfer
 //!
-//! A `no_std + alloc` **LT fountain-code core** for **unidirectional optical
-//! data transfer**: move a file between two devices using only a screen and a
-//! camera — no network path, no pairing, no retransmission. The sender emits
-//! an endless stream of self-contained frames; the receiver reconstructs the
-//! payload from *any* ~K·1.15 distinct frames, in any order. **Dropped frames
-//! cost time, never correctness.**
+//! A `no_std + alloc` LT fountain-code core for one-way data transfer. A
+//! protocol-v3 sender emits self-contained frames and the receiver peels
+//! verified equations until the original byte stream is complete.
 //!
-//! The current wire protocol is **version 3** (frame magic `D1 0F`).
+//! The default causal first phase is the invertible transform
+//! `y[0] = x[0]`, `y[i] = x[i-1] XOR x[i]`; a deterministic robust-soliton
+//! tail supplies repairs. Completion under loss is probabilistic and no fixed
+//! overhead is guaranteed. The 32-bit frame and stream tags detect accidental
+//! corruption but are not message authentication codes.
 //!
-//! ## What makes this crate novel
-//!
-//! - **The causal weave** ([`session::Sender`], default mode): the first K
-//!   frames are a *causal* encoding of the source blocks,
-//!   `y[0] = x[0]`, `y[i] = x[i-1] XOR x[i]` — an **invertible
-//!   lower-bidiagonal matrix**. Receiving the first K frames, in any order,
-//!   reconstructs the payload in exactly K frames; a missing frame cuts the
-//!   chain into *components* that peeling recovers cheaply. An endless
-//!   deterministic robust-soliton repair tail follows, so receivers that
-//!   start mid-stream still decode.
-//! - **Per-frame integrity**: every 25-byte frame header carries two
-//!   BLAKE3-derived 32-bit tags — `frame_tag` (verified on arrival, so a
-//!   damaged frame becomes an erasure instead of poisoning the decoder) and
-//!   `stream_tag` (verified after reconstruction).
-//! - **Authenticated encryption** (`encryption` feature): container-level
-//!   XChaCha20-Poly1305 with Argon2id key derivation and zeroized keys — a
-//!   co-receiving camera sees only ciphertext.
-//! - **Extreme throughput**: SIMD XOR engine (AVX2/SSE2/NEON/scalar, no_std
-//!   via `core::arch`), flat word arena (no per-frame heap allocation),
-//!   two-level quantized degree sampling, and a bijective multiplicative-hash
-//!   dedup set. Measured decode throughput is **3.9–6.6 Gbps** on the
-//!   reference machine (see the module docs and `README.md`).
+//! Feature `encryption` adds XChaCha20-Poly1305 containers, the JRC
+//! designated-judge recovery construction, and the JRP composition interface.
+//! JRP becomes a proof system only when the caller supplies a sound,
+//! zero-knowledge [`jrp::RelationProofSystem`] backend.
 //!
 //! ## Quick start
 //!
@@ -62,6 +45,8 @@
 //! | [`session`] | High-level middleware: `Sender` emits frames, `Receiver` reconstructs the stream |
 //! | [`container`] | DCF3 file container: name + type + bytes + digest, gzip, optional AEAD |
 //! | [`crypto`] | Argon2id keys, XChaCha20-Poly1305 AEAD, nonces |
+//! | [`jrc`] *(encryption)* | Judge-recoverable commitment: hiding commitment + judge-only recovery channel |
+//! | [`jrp`] *(encryption)* | Composition with an application-supplied relation-proof backend |
 //! | [`capacity`] | Frame-capacity arithmetic (`k` fits a `u16`?) |
 //! | [`soliton`] | Robust-soliton degree distribution and the quantized `DegreeCdf` |
 //! | [`prng`] | Deterministic wire-format PRNG (`SplitMix32`, `frame_seed`) |
@@ -73,8 +58,8 @@
 //! ## Features
 //!
 //! - `std` (default): gzip container compression via `flate2`.
-//! - `encryption`: container AEAD via `argon2` + `chacha20poly1305` +
-//!   `getrandom` + `zeroize`.
+//! - `encryption`: Argon2id, XChaCha20-Poly1305, X25519 JRC/JRP support,
+//!   operating-system randomness, and key zeroization.
 //!
 //! Build a pure `no_std + alloc` library with
 //! `cargo build --release --no-default-features`, and add authenticated
@@ -82,7 +67,7 @@
 //!
 //! ## License
 //!
-//! Apache-2.0. See the repository `LICENSE` and `NOTICE`.
+//! Apache-2.0. See the repository `LICENSE`.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -96,6 +81,10 @@ pub mod dlog;
 pub mod error;
 pub mod fountain;
 pub mod frame;
+#[cfg(feature = "encryption")]
+pub mod jrc;
+#[cfg(feature = "encryption")]
+pub mod jrp;
 pub mod prng;
 pub mod session;
 pub mod set;
@@ -112,8 +101,8 @@ pub use container::{
 };
 #[cfg(feature = "encryption")]
 pub use container::{
-    pack_file_encrypted, pack_file_encrypted_with_password, unpack_file_with_key,
-    unpack_file_with_password,
+    pack_file_encrypted, pack_file_encrypted_with_password, pack_file_jrc, unpack_file_jrc,
+    unpack_file_with_key, unpack_file_with_password, JrcPackedFile,
 };
 pub use error::{Error, Result};
 pub use fountain::{frame_indices, LtDecoder, LtEncoder};
@@ -121,6 +110,16 @@ pub use frame::{
     checksum32, fnv1a, frame_checksum, pack_frame, parse_frame, stream_identity, FrameHeader,
     StreamIdentity, HEADER_LEN, MAGIC0, MAGIC1, MAX_FILE_BYTES, MAX_STREAM_BYTES,
 };
+#[cfg(feature = "encryption")]
+pub use jrc::{
+    commit, commit_with_prover_opening, envelope_len, judge_recover, keygen, verify_ext,
+    JrcCommitment, JrcProverOpening, JudgeKeyPair, JudgePublicKey, JudgeSecretKey, COMMIT_LEN,
+    ENVELOPE_OVERHEAD, MAX_MESSAGE_LEN,
+};
+#[cfg(feature = "encryption")]
+pub use jrp::{
+    JrpProof, JrpPublicInput, RelationProofSystem, MAX_RELATION_PROOF_LEN, PROOF_OVERHEAD,
+};
 pub use prng::{frame_seed, SplitMix32};
-pub use session::{Frame as SessionFrame, Receiver, Sender};
+pub use session::{Frame as SessionFrame, Receiver, ReceiverLimits, Sender};
 pub use soliton::{soliton_cdf, SOLITON_C, SOLITON_DELTA};

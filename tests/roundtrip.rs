@@ -3,7 +3,7 @@ use deopti_transfer::container::{
 };
 use deopti_transfer::fountain::{LtDecoder, LtEncoder};
 use deopti_transfer::prng::SplitMix32;
-use deopti_transfer::session::{Receiver, Sender};
+use deopti_transfer::session::{Receiver, ReceiverLimits, Sender};
 use deopti_transfer::Error;
 
 fn test_payload(len: usize) -> Vec<u8> {
@@ -57,7 +57,7 @@ fn payload_survives_the_fountain() {
 }
 
 #[test]
-fn dropping_30_percent_costs_time_never_correctness() {
+fn deterministic_30_percent_loss_fixture_recovers() {
     let rt = round_trip(512 * 1024, 2933, 23, 0.3);
     assert_eq!(rt.recovered, Some(test_payload(512 * 1024)));
     assert!(rt.overhead < 1.6, "overhead {:.2} too high", rt.overhead);
@@ -213,11 +213,15 @@ fn container_rejects_malformed_input() {
 
 #[test]
 fn names_are_sanitised() {
-    let cases: [(&str, &str); 4] = [
+    let cases: [(&str, &str); 8] = [
         ("../../etc/passwd", "passwd"),
         ("C:\\Windows\\System32\\drivers\\etc\\hosts", "hosts"),
         ("茅vidence.pdf", "茅vidence.pdf"),
         ("report v2 (final).tar.gz", "report v2 (final).tar.gz"),
+        ("CON", "_CON"),
+        ("com1.txt", "_com1.txt"),
+        ("bad:name?.txt", "bad_name_.txt"),
+        ("safe\u{202e}fdp.exe", "safefdp.exe"),
     ];
     for (sent, expected) in cases {
         let packed = pack_file(sent, "application/octet-stream", &[1, 2, 3]).unwrap();
@@ -227,6 +231,25 @@ fn names_are_sanitised() {
         let packed = pack_file(sent, "application/octet-stream", &[1]).unwrap();
         assert_eq!(unpack_file(&packed.container).unwrap().name, "transfer.bin");
     }
+}
+
+#[test]
+fn mime_metadata_is_validated_on_pack_and_unpack() {
+    assert!(matches!(
+        pack_file("x", "text/plain\r\nX-Injected: yes", b"x"),
+        Err(Error::Meta)
+    ));
+    assert!(matches!(
+        pack_file("x", "not-a-media-type", b"x"),
+        Err(Error::Meta)
+    ));
+
+    let mut packed = pack_file("x", "text/plain", b"x").unwrap().container;
+    // DCF3 fixed header is followed by name then media type. Metadata is not
+    // covered by the plain-container digest, so parsing must validate it.
+    let name_len = u16::from_le_bytes([packed[5], packed[6]]) as usize;
+    packed[deopti_transfer::FILE_HEADER_LEN + name_len] = 0xff;
+    assert!(matches!(unpack_file(&packed), Err(Error::Meta)));
 }
 
 #[test]
@@ -320,6 +343,23 @@ fn receiver_ignores_crafted_amplification_frames() {
         receiver.push(&huge).is_none(),
         "oversized total_len must be rejected"
     );
+    assert!(!receiver.is_active());
+}
+
+#[test]
+fn receiver_applies_configured_limits_before_allocating() {
+    let payload = test_payload(4096);
+    let mut sender = Sender::new(&payload, 512, 0x4242);
+    let frame = sender.next_frame().to_bytes();
+    let mut receiver = Receiver::with_limits(ReceiverLimits {
+        max_stream_bytes: 1024,
+        max_source_blocks: 4,
+        max_block_len: 256,
+    });
+    assert!(matches!(
+        receiver.try_push(&frame),
+        Err(Error::ResourceLimit)
+    ));
     assert!(!receiver.is_active());
 }
 
@@ -492,7 +532,7 @@ fn systematic_reduces_frames_needed_under_loss() {
 }
 
 #[test]
-fn causal_overhead_is_bounded_under_loss() {
+fn causal_overhead_stays_below_fixture_threshold() {
     let drop = |seq: u32, rate: f64| {
         let u = SplitMix32::new(seq ^ 0x5eed_1234).next_u32() as f64 / 4_294_967_296.0;
         u < rate
@@ -596,4 +636,71 @@ fn password_api_derives_per_container_key_and_round_trips() {
         unpack_file_with_password(&packed.container, b"correct horse battery staple").unwrap();
     assert_eq!(file.bytes, b"password protected");
     assert!(unpack_file_with_password(&packed.container, b"wrong password").is_err());
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn jrc_container_round_trips_through_the_fountain() {
+    use deopti_transfer::container::{pack_file_jrc, unpack_file_jrc};
+    use deopti_transfer::jrc::keygen;
+    let kp = keygen().unwrap();
+    let source = b"judge-recoverable optical payload\n".repeat(3000);
+    let nonce = [0x42u8; 24];
+    let packed = pack_file_jrc("report.pdf", "application/pdf", &source, &kp.ek, &nonce).unwrap();
+
+    // The JRC envelope flows through the fountain exactly like a container:
+    // no handshake, the receiver reconstructs the opaque envelope bytes.
+    let mut sender = Sender::try_new(&packed.envelope, 1465, 0x0c_d1).unwrap();
+    let mut receiver = Receiver::new();
+    let mut envelope = None;
+    for _ in 0..sender.k() as usize * 4 {
+        let frame = sender.try_next_frame().unwrap();
+        if let Some(container) = receiver.try_push(&frame.to_bytes()).unwrap() {
+            envelope = Some(container);
+            break;
+        }
+    }
+    let envelope = envelope.expect("stream completed");
+
+    // External hiding: the reconstructed envelope never contains the
+    // plaintext payload.
+    assert!(!envelope.windows(source.len()).any(|w| w == &source[..]));
+
+    // The designated judge recovers and verifies the file end to end.
+    let file = unpack_file_jrc(&envelope, &kp.dk).unwrap();
+    assert_eq!(file.name, "report.pdf");
+    assert_eq!(file.mime_type, "application/pdf");
+    assert_eq!(file.bytes, source);
+    assert!(verify_file(&file));
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn jrc_container_rejects_wrong_judge_and_tampering() {
+    use deopti_transfer::container::{pack_file_jrc, unpack_file_jrc};
+    use deopti_transfer::jrc::keygen;
+    let kp_a = keygen().unwrap();
+    let kp_b = keygen().unwrap();
+    let source = b"top secret\n".repeat(1000);
+    let nonce = [0x42u8; 24];
+    let packed = pack_file_jrc("s.txt", "text/plain", &source, &kp_a.ek, &nonce).unwrap();
+
+    // Judge-only recoverability: the wrong judge's key cannot recover.
+    assert!(matches!(
+        unpack_file_jrc(&packed.envelope, &kp_b.dk),
+        Err(Error::Crypto)
+    ));
+
+    // A single flipped byte anywhere is rejected (AEAD tag + DCF3 digest).
+    let mut tampered = packed.envelope.clone();
+    let n = tampered.len();
+    tampered[n - 1] ^= 0xff;
+    assert!(unpack_file_jrc(&tampered, &kp_a.dk).is_err());
+
+    // Truncation is rejected.
+    assert!(unpack_file_jrc(&packed.envelope[..packed.envelope.len() - 1], &kp_a.dk).is_err());
+
+    // A plain (non-JRC) DCF3 container is rejected on envelope parsing.
+    let plain = pack_file("p.txt", "text/plain", b"x").unwrap();
+    assert!(unpack_file_jrc(&plain.container, &kp_a.dk).is_err());
 }

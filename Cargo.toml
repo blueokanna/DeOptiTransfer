@@ -1,18 +1,25 @@
 [package]
 name = "deopti_transfer"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/blueokanna/DeOptiTransfer"
 readme = "README.md"
-description = "The no_std LT Fountain Code Core for Unidirectional Optical Data Transfer. A bit-exact, zero-handshake engine enabling reliable screen-to-camera file transmission over visual channels."
+description = "A no_std LT fountain-code core with bounded decoding and optional authenticated or judge-recoverable encryption."
+exclude = ["creative.md"]
 keywords = ["fountain", "lt-code", "qr", "optical", "transfer"]
 categories = ["encoding", "compression", "cryptography", "no-std"]
 
 [features]
 default = ["std"]
 std = ["dep:flate2"]
-encryption = ["dep:argon2", "dep:chacha20poly1305", "dep:getrandom", "dep:zeroize"]
+encryption = [
+    "dep:argon2",
+    "dep:chacha20poly1305",
+    "dep:getrandom",
+    "dep:zeroize",
+    "dep:x25519-dalek",
+]
 
 [dependencies]
 rustbinary = { version = "0.1.4", default-features = false, features = [
@@ -24,12 +31,18 @@ serde = { version = "1", default-features = false, features = [
 ] }
 blake3 = { version = "1.8.6", default-features = false }
 libm = "0.2"
-argon2 = { version = "0.5", default-features = false, features = ["alloc"], optional = true }
+argon2 = { version = "0.5", default-features = false, features = [
+    "alloc",
+], optional = true }
 chacha20poly1305 = { version = "0.11", default-features = false, features = [
     "alloc",
 ], optional = true }
 getrandom = { version = "0.4", default-features = false, optional = true }
 zeroize = { version = "1.8", default-features = false, optional = true }
+x25519-dalek = { version = "3.0.0", default-features = false, features = [
+    "static_secrets",
+    "zeroize",
+], optional = true }
 flate2 = { version = "1.1.9", default-features = false, features = [
     "rust_backend",
 ], optional = true }

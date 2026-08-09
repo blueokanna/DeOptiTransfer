@@ -97,7 +97,20 @@ fn bench_decode(c: &mut Criterion) {
         let data = payload(mb);
         let mut encoder = LtEncoder::new(&data, BLOCK_LEN, 42);
         let k = encoder.k();
-        let frames: Vec<Vec<u8>> = (0..k as u32).map(|seq| encoder.encode(seq)).collect();
+        let mut frames = Vec::new();
+        let mut verifier = LtDecoder::new(k, BLOCK_LEN, 42, data.len());
+        for seq in 0..(k as u32).saturating_mul(8) {
+            let frame = encoder.encode(seq);
+            verifier.add_frame(seq, &frame);
+            frames.push(frame);
+            if verifier.is_complete() {
+                break;
+            }
+        }
+        assert!(
+            verifier.is_complete(),
+            "benchmark fixture must contain a complete decode"
+        );
         let payload_len = data.len();
         group.throughput(Throughput::Bytes(payload_len as u64));
         group.bench_with_input(BenchmarkId::new("peel", mb), &frames, |b, frames| {

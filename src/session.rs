@@ -185,6 +185,30 @@ pub struct Receiver {
     decoder: Option<LtDecoder>,
     identity: Option<StreamIdentity>,
     delivered: bool,
+    limits: ReceiverLimits,
+}
+
+/// Resource policy applied before a receiver allocates decoder state for a
+/// newly observed stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiverLimits {
+    pub max_stream_bytes: u64,
+    pub max_source_blocks: usize,
+    pub max_block_len: usize,
+}
+
+impl ReceiverLimits {
+    pub const MAXIMUM: Self = Self {
+        max_stream_bytes: MAX_STREAM_BYTES,
+        max_source_blocks: crate::capacity::MAX_SOURCE_BLOCKS,
+        max_block_len: u16::MAX as usize,
+    };
+}
+
+impl Default for ReceiverLimits {
+    fn default() -> Self {
+        Self::MAXIMUM
+    }
 }
 
 impl Receiver {
@@ -193,6 +217,17 @@ impl Receiver {
             decoder: None,
             identity: None,
             delivered: false,
+            limits: ReceiverLimits::MAXIMUM,
+        }
+    }
+
+    /// Create a receiver with application-specific allocation limits.
+    pub const fn with_limits(limits: ReceiverLimits) -> Self {
+        Self {
+            decoder: None,
+            identity: None,
+            delivered: false,
+            limits,
         }
     }
 
@@ -210,6 +245,12 @@ impl Receiver {
                 return Err(Error::StreamConflict);
             }
         } else {
+            if h.total_len as u64 > self.limits.max_stream_bytes
+                || h.k as usize > self.limits.max_source_blocks
+                || h.block_len as usize > self.limits.max_block_len
+            {
+                return Err(Error::ResourceLimit);
+            }
             let decoder = match h.flags {
                 FLAG_CAUSAL => LtDecoder::try_new_causal(
                     h.k as usize,
@@ -262,6 +303,10 @@ impl Receiver {
     #[inline]
     pub const fn identity(&self) -> Option<StreamIdentity> {
         self.identity
+    }
+
+    pub const fn limits(&self) -> ReceiverLimits {
+        self.limits
     }
 }
 

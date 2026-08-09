@@ -1,6 +1,6 @@
 //! The robust-soliton degree distribution and [`DegreeCdf`], a two-level
-//! quantized sampler that is exactly equal to binary search while running
-//! 3–5× faster on large K.
+//! quantized sampler whose bracketing invariant yields the same result as a
+//! full binary search.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -14,6 +14,9 @@ const QUANT: usize = 1024;
 
 pub fn soliton_cdf(k: usize) -> Vec<f64> {
     let mut cdf = vec![0.0; k];
+    if k == 0 {
+        return cdf;
+    }
     if k == 1 {
         cdf[0] = 1.0;
         return cdf;
@@ -45,8 +48,9 @@ pub fn soliton_cdf(k: usize) -> Vec<f64> {
 
 /// The robust-soliton CDF with a two-level quantized sampler.
 ///
-/// `sample` is *exactly* equal to a binary search over the CDF (proven over
-/// a 2^20 grid per K) while touching only a small cache-warm window.
+/// For finite `u` in `[0, 1)`, the quantized endpoints bracket the global
+/// lower bound, so `sample` returns the same degree as [`degree_binary`].
+/// Boundary and large deterministic sample sets are covered by tests.
 pub struct DegreeCdf {
     cdf: Vec<f64>,
     quant: Vec<u32>,
@@ -56,6 +60,9 @@ impl DegreeCdf {
     pub fn new(k: usize) -> Self {
         let cdf = soliton_cdf(k);
         let mut quant = vec![0u32; QUANT + 1];
+        if cdf.is_empty() {
+            return Self { cdf, quant };
+        }
         for (i, q) in quant.iter_mut().enumerate() {
             *q = lower_bound(&cdf, (i as f64) / (QUANT as f64)) as u32;
         }
@@ -74,6 +81,15 @@ impl DegreeCdf {
 
     #[inline]
     pub fn sample(&self, u: f64) -> usize {
+        if self.cdf.is_empty() {
+            return 0;
+        }
+        if u.is_nan() || u <= 0.0 {
+            return 1;
+        }
+        if u >= 1.0 {
+            return self.cdf.len();
+        }
         let i = (u * QUANT as f64) as usize;
         let mut lo = self.quant[i] as usize;
         let mut hi = self.quant[i + 1] as usize;
@@ -104,6 +120,15 @@ fn lower_bound(cdf: &[f64], x: f64) -> usize {
 }
 
 pub fn degree_binary(cdf: &[f64], u: f64) -> usize {
+    if cdf.is_empty() {
+        return 0;
+    }
+    if u.is_nan() || u <= 0.0 {
+        return 1;
+    }
+    if u >= 1.0 {
+        return cdf.len();
+    }
     (lower_bound(cdf, u) + 1).min(cdf.len())
 }
 
@@ -136,6 +161,23 @@ mod tests {
             for i in 0..QUANT {
                 assert!(dc.quant[i] <= dc.quant[i + 1], "k={k} quant[{i}]");
             }
+        }
+    }
+
+    #[test]
+    fn public_sampling_boundaries_are_total() {
+        let empty = DegreeCdf::new(0);
+        assert_eq!(empty.sample(0.5), 0);
+        assert_eq!(degree_binary(&[], 0.5), 0);
+
+        let dc = DegreeCdf::new(17);
+        for u in [f64::NAN, f64::NEG_INFINITY, -1.0, 0.0] {
+            assert_eq!(dc.sample(u), 1);
+            assert_eq!(degree_binary(dc.cdf(), u), 1);
+        }
+        for u in [1.0, 2.0, f64::INFINITY] {
+            assert_eq!(dc.sample(u), 17);
+            assert_eq!(degree_binary(dc.cdf(), u), 17);
         }
     }
 }

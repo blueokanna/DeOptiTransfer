@@ -17,6 +17,12 @@ use crate::crypto::NONCE_LEN;
 use crate::crypto::{decrypt, encrypt, EncryptionKey, TAG_LEN};
 use crate::error::{Error, Result};
 use crate::frame::MAX_FILE_BYTES;
+#[cfg(feature = "encryption")]
+use crate::frame::MAX_STREAM_BYTES;
+#[cfg(feature = "encryption")]
+use crate::jrc::{
+    commit, judge_recover, JrcCommitment, JudgePublicKey, JudgeSecretKey, MAX_MESSAGE_LEN,
+};
 
 pub const FILE_HEADER_LEN: usize = 73;
 const FILE_MAGIC: [u8; 4] = [0x44, 0x43, 0x46, 0x33];
@@ -29,6 +35,7 @@ const GZIP_ROOM: usize = 64;
 #[cfg(feature = "std")]
 const GZIP_MIN_LEN: usize = 18;
 const DEFAULT_NAME: &str = "transfer.bin";
+const DEFAULT_MIME: &str = "application/octet-stream";
 
 const CFG: Config = Config::legacy()
     .with_little_endian()
@@ -47,6 +54,21 @@ pub struct PackedOpticalFile {
     pub container: Vec<u8>,
     pub compression: Compression,
     pub encrypted: bool,
+    pub original_size: usize,
+    pub transmitted_size: usize,
+}
+
+/// A file packed for judge-recoverable optical transfer (`JRC` mode).
+///
+/// `envelope` is the serialized JRC transcript
+/// (`magic ‖ c ‖ aux`) that flows through the fountain stream unchanged.
+/// An external observer reconstructing the stream sees only the hiding
+/// commitment and ciphertext; the designated judge recovers the plaintext
+/// DCF3 container with [`unpack_file_jrc`] and verifies it end to end.
+#[cfg(feature = "encryption")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JrcPackedFile {
+    pub envelope: Vec<u8>,
     pub original_size: usize,
     pub transmitted_size: usize,
 }
@@ -170,11 +192,7 @@ fn prepare(name: &str, mime_type: &str, bytes: &[u8]) -> Result<Prepared> {
         });
     }
     let name_bytes = safe_file_name(name).into_bytes();
-    let type_bytes = if mime_type.is_empty() {
-        b"application/octet-stream".to_vec()
-    } else {
-        mime_type.as_bytes().to_vec()
-    };
+    let type_bytes = normalize_mime_type(mime_type)?.into_bytes();
     if name_bytes.len() > u16::MAX as usize || type_bytes.len() > u16::MAX as usize {
         return Err(Error::Meta);
     }
@@ -256,6 +274,62 @@ pub fn unpack_file_with_password(container: &[u8], password: &[u8]) -> Result<Op
     unpack_impl(container, Some(key.bytes()))
 }
 
+/// Pack a file for judge-recoverable optical transfer.
+///
+/// The file is first packed into a plaintext DCF3 container, then committed
+/// with the JRC primitive against the judge's public key. The returned
+/// `envelope` is fed to a [`Sender`](crate::session::Sender) as the
+/// transmitted container. Co-receiving cameras see only the hiding
+/// commitment and ciphertext; the judge recovers the container with
+/// [`unpack_file_jrc`].
+///
+/// A random nonce is recommended for transcript unlinkability. JRC derives a
+/// fresh key from a fresh ephemeral X25519 secret on every call, so nonce
+/// uniqueness is not required for AEAD safety in this API.
+#[cfg(feature = "encryption")]
+pub fn pack_file_jrc(
+    name: &str,
+    mime_type: &str,
+    bytes: &[u8],
+    judge_pk: &JudgePublicKey,
+    nonce: &[u8; NONCE_LEN],
+) -> Result<JrcPackedFile> {
+    let inner = pack_file(name, mime_type, bytes)?;
+    if inner.container.len() > MAX_MESSAGE_LEN {
+        return Err(Error::TooLarge {
+            len: inner.container.len() as u64,
+            max: MAX_MESSAGE_LEN as u64,
+        });
+    }
+    let committed = commit(judge_pk, &inner.container, nonce)?;
+    let envelope = committed.to_bytes();
+    if envelope.len() as u64 > MAX_STREAM_BYTES {
+        return Err(Error::TooLarge {
+            len: envelope.len() as u64,
+            max: MAX_STREAM_BYTES,
+        });
+    }
+    let transmitted_size = envelope.len();
+    Ok(JrcPackedFile {
+        envelope,
+        original_size: bytes.len(),
+        transmitted_size,
+    })
+}
+
+/// Recover a file from a judge-recoverable envelope with the judge's secret
+/// key.
+///
+/// The JRC binding check and the DCF3 digest both verify the recovered
+/// container before any metadata is trusted: a wrong judge key, a tampered
+/// envelope, or a single flipped byte is rejected.
+#[cfg(feature = "encryption")]
+pub fn unpack_file_jrc(envelope: &[u8], dk: &JudgeSecretKey) -> Result<OpticalFile> {
+    let committed = JrcCommitment::from_bytes(envelope)?;
+    let container = judge_recover(dk, &committed.commitment, &committed.aux)?;
+    unpack_file(&container)
+}
+
 fn unpack_impl(container: &[u8], key: Option<&[u8; 32]>) -> Result<OpticalFile> {
     #[cfg(not(feature = "encryption"))]
     let _ = key;
@@ -331,12 +405,8 @@ fn unpack_impl(container: &[u8], key: Option<&[u8; 32]>) -> Result<OpticalFile> 
         return Err(Error::Crypto);
     }
 
-    let mime = String::from_utf8_lossy(type_bytes);
-    let mime_type = if mime.is_empty() {
-        "application/octet-stream".to_string()
-    } else {
-        mime.into_owned()
-    };
+    let mime = core::str::from_utf8(type_bytes).map_err(|_| Error::Meta)?;
+    let mime_type = normalize_mime_type(mime)?;
 
     Ok(OpticalFile {
         name: safe_file_name(&String::from_utf8_lossy(name_bytes)),
@@ -413,15 +483,27 @@ pub fn verify_file(file: &OpticalFile) -> bool {
 
 pub fn safe_file_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("");
-    let cleaned = base
+    let mut cleaned = base
         .chars()
-        .filter(|c| !is_control(*c))
+        .filter(|c| !is_control(*c) && !is_bidi_control(*c))
+        .map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect::<String>()
         .trim()
+        .trim_end_matches(['.', ' '])
         .to_string();
     if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
         DEFAULT_NAME.to_string()
     } else {
+        let stem = cleaned.split('.').next().unwrap_or("");
+        if is_windows_device_name(stem) {
+            cleaned.insert(0, '_');
+        }
         cleaned
     }
 }
@@ -430,6 +512,66 @@ pub fn safe_file_name(name: &str) -> String {
 fn is_control(c: char) -> bool {
     let v = c as u32;
     v <= 0x1f || v == 0x7f
+}
+
+#[inline]
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x061c | 0x200e | 0x200f | 0x202a..=0x202e | 0x2066..=0x2069
+    )
+}
+
+fn is_windows_device_name(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'))
+}
+
+fn normalize_mime_type(mime_type: &str) -> Result<String> {
+    let value = mime_type.trim();
+    if value.is_empty() {
+        return Ok(DEFAULT_MIME.to_string());
+    }
+    if !value.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        return Err(Error::Meta);
+    }
+    let media = value.split(';').next().unwrap_or("").trim();
+    let Some((type_name, subtype)) = media.split_once('/') else {
+        return Err(Error::Meta);
+    };
+    if type_name.is_empty()
+        || subtype.is_empty()
+        || !type_name.bytes().all(is_mime_token_byte)
+        || !subtype.bytes().all(is_mime_token_byte)
+    {
+        return Err(Error::Meta);
+    }
+    Ok(value.to_string())
+}
+
+#[inline]
+fn is_mime_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 pub fn is_precompressed_type(mime_type: &str) -> bool {

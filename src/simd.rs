@@ -8,7 +8,29 @@
 use core::arch::x86_64::*;
 
 #[cfg(target_arch = "x86_64")]
+use core::sync::atomic::{AtomicU8, Ordering};
+
+/// Tri-state cache of the AVX2 runtime check: `0` unknown, `1` absent,
+/// `2` present. `__cpuid` / `_xgetbv` are comparatively expensive and the
+/// result cannot change for the lifetime of the process, so it is computed
+/// once and reused on every `xor_into` call.
+#[cfg(target_arch = "x86_64")]
+static AVX2_STATE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(target_arch = "x86_64")]
 fn avx2_available() -> bool {
+    match AVX2_STATE.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    let detected = detect_avx2();
+    AVX2_STATE.store(if detected { 2 } else { 1 }, Ordering::Relaxed);
+    detected
+}
+
+#[cfg(target_arch = "x86_64")]
+fn detect_avx2() -> bool {
     use core::arch::x86_64::{__cpuid, _xgetbv};
     let info = __cpuid(1);
     let osxsave = info.ecx & (1 << 27) != 0;
@@ -28,7 +50,11 @@ fn avx2_available() -> bool {
 /// XOR `src` into `dst` in place, using the fastest SIMD path available on
 /// the current CPU (AVX2, SSE2, NEON, or scalar).
 pub fn xor_into(dst: &mut [u32], src: &[u32]) {
-    debug_assert_eq!(dst.len(), src.len());
+    assert_eq!(
+        dst.len(),
+        src.len(),
+        "xor_into requires equal-length slices"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if avx2_available() {
@@ -157,5 +183,11 @@ mod tests {
         {
             let _ = avx2_available();
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "xor_into requires equal-length slices")]
+    fn unequal_lengths_are_rejected_before_simd_access() {
+        xor_into(&mut [0u32; 8], &[0u32; 7]);
     }
 }

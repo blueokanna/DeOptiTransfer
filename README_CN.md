@@ -1,303 +1,364 @@
 # deopti-transfer 中文文档
 
-[English](README.md)
+`deopti-transfer` 是面向单向传输信道（例如屏幕到摄像头）的 Rust
+`no_std + alloc` LT 喷泉码核心。它提供二进制传输协议、有界剥离解码器、
+文件容器、可选认证加密，以及指定裁决者恢复构造；它不负责生成二维码，也
+不控制摄像头。
 
-> `no_std` 的 LT 喷泉码核心，用于单向光学数据传输——只用一块屏幕和一个
-> 摄像头在两台设备之间传送文件：无网络路径、无配对、无重传。
+当前格式版本：
 
-`deopti-transfer` 是一个 `no_std + alloc` 的喷泉码核心。发送端持续发射
-自包含的帧；接收端无需任何确认或重传控制即可重建数据流。**丢帧只增加
-时间，绝不损害正确性。**
+- 帧协议：v3，魔数 `D1 0F`；
+- 文件容器：DCF3，魔数 `DCF3`；
+- 裁决者可恢复承诺：JRC1；
+- 裁决者可恢复证明组合：JRP2。
 
-当前线上协议为 **v3**（帧魔法字 `D1 0F`）。v2 帧被有意拒绝：它没有每帧
-完整性标签，损坏的方程可能污染解码器。
+实现以生产环境为目标，但尚未经过独立安全审计。JRC/JRP 的命名以及“因果
+首段”不能直接作为学术原创性的证据。托管承诺、可提取承诺、指定验证者系统
+等方向与其密切相关；任何论文级创新声明都必须先完成系统的现有技术检索。
 
----
+[English README](README.md)
 
-## 核心亮点
+## 已实现能力
 
-- **因果编织（默认发送模式）**——可逆下双对角矩阵首段：`K` 帧即可
-  **恰好用 K 帧**、任意顺序重建载荷；缺失一帧只是把链条切成若干
-  **分量**，剥皮解码可廉价恢复；其后是无穷的确定性鲁棒孤子修复尾，
-  中途接入的接收端也能完成解码。
-- **每帧完整性**——25 字节帧头携带两个 BLAKE3 派生的 32 位标签：
-  `frame_tag`（到达即验）、`stream_tag`（重建后再验）。损坏帧被当作
-  擦除，永不污染解码器。
-- **认证加密（可选）**——容器级 XChaCha20-Poly1305，Argon2id 派生密钥、
-  密钥零化；旁路摄像头只能看到密文。
-- **极限吞吐**——SIMD XOR 引擎（AVX2/SSE2/NEON/标量运行时派发，
-  通过 `core::arch` 支持 no_std）、扁平字竞技场（每帧零堆分配）、两级
-  量化度采样、双射乘性哈希去重。参考机器上**解码可达 3.8–6.6 Gbps**。
+- 三种 LT 模式：因果首段加修复尾流（默认）、直接系统码加修复尾流、纯
+  鲁棒孤子编码。
+- 确定性线格式与黄金向量。
+- AVX2、SSE2、NEON、标量 XOR 路径，并在需要的平台运行时分派。
+- 逐帧损坏过滤、流身份锁定、重复帧抑制和重建后整流校验。
+- DCF3 文件元数据、有界 gzip 解压、文件名/MIME 校验和 BLAKE3 文件摘要。
+- 可选 XChaCha20-Poly1305 加密与 Argon2id 口令派生。
+- 可选的基于 X25519 的 JRC 指定裁决者恢复。
+- 由应用提供关系证明后端的 JRP 组合；没有用公开哈希冒充“证明”，也没有
+  内置通用 SNARK/STARK。
+- 可配置接收上限与解码器硬存储预算。
 
----
-
-## 协议 v3 —— 帧、标签、身份
-
-每个 QR 帧完全自描述：无握手；接收端可在中途锁定数据流，新的会话 id
-直接开启新传输。
-
-**25 字节小端帧头：**
-
-```text
- 0  2 字节  magic        D1 0F（协议 v3）
- 2  u8      flags        bit0 直接系统性，bit1 因果
- 3  u16     session_id   每次发送端启动随机
- 5  u32     seq          驱动喷泉/编织
- 9  u16     k            源块数量
-11  u16     block_len    每帧载荷字节数
-13  u32     total_len    容器总长
-17  u32     stream_tag   整个容器的 BLAKE3 派生标签
-21  u32     frame_tag    本帧头+数据块的 BLAKE3 派生标签
-```
-
-帧头由 `rustbinary` 的定宽小端 legacy 配置序列化，字节布局由黄金向量
-测试钉死。
-
-**`frame_tag`** = `BLAKE3(flags ‖ session ‖ seq ‖ k ‖ block_len ‖ total_len
-‖ stream_tag ‖ block)` 的前 4 字节。`parse_frame` 在帧进入解码器之前
-校验：损坏帧作为擦除被拒绝，同一序号稍后可重新接收。
-
-**`stream_tag`** = `BLAKE3(container)` 的前 4 字节（`checksum32`），标识
-完整容器并在重建后复验。两者都只能检测意外光学损坏，**不是消息认证码**；
-对抗主动篡改请使用 `encryption` 特性。
-
-**流身份**——接收端锁定第一个合法的
-`StreamIdentity { flags, session_id, k, block_len, total_len, stream_tag }`。
-来自其它流的帧返回 `Error::StreamConflict` 且不丢弃当前进度；调用
-`Receiver::reset` 可主动切换数据流。
-
-**上限**——`MAX_FILE_BYTES = 64 MiB`；`MAX_STREAM_BYTES =
-64 MiB + 2·0xFFFF + 128`（容器头与元数据余量）。解码器载荷存储上限为
-源块竞技场的 4 倍，且容量在去重集合增长前先做检查。
-
----
-
-## 因果编织构造
-
-默认发送端（`Sender::new`）发射**因果**首段。对源块 `x[0]..x[K-1]`：
-
-```text
-y[0] = x[0]
-y[i] = x[i-1] XOR x[i]     （1 <= i < K）
-```
-
-这是一个**可逆的下双对角编码矩阵**。收到前 `K` 帧——任意顺序——恰好
-`K` 帧即可重建载荷。丢失首段的一帧只是把链条切成**分量**，而非留下孤立
-缺失块；当后续修复方程解出某一分量的一个成员时，剥皮会沿该分量所有已收
-到的边传播。
-
-首段之后，发送端无限发射确定性的鲁棒孤子 LT 修复方程，中途接入的接收端
-仍可完成解码。
-
-该构造由黄金向量钉死，并在乱序、孤立断链、确定性丢帧下均有测试。
-
-### 实测回归（K = 139，确定性逐帧丢帧掩码）
-
-解码器接纳帧数相对 K 的倍数：
-
-| 丢帧率 | 因果 | 直接系统性 | 纯 RSD |
-| --- | ---: | ---: | ---: |
-| 0%  | **1.000 K** | **1.000 K** | 1.317 K |
-| 10% | **1.043 K** | 1.403 K | 1.173 K |
-| 30% | **1.554 K** | 1.554 K | 1.317 K |
-
-这是确定性回归测量——不是通用信道模型，也不构成学术新颖性声明；由
-`systematic_reduces_frames_needed_under_loss` 复现。当实测信道更偏爱某
-模式时，应用可显式选择直接系统性或纯 RSD。
-
----
-
-## 传输模式
-
-| 模式 | `Sender` 构造器 | flags | 首段 |
-| --- | --- | --- | --- |
-| 因果（默认） | `Sender::new` / `try_new` | `FLAG_CAUSAL` | 双对角编织 |
-| 直接系统性 | `Sender::new_systematic` / `try_new_systematic` | `FLAG_SYSTEMATIC` | 源块原样 |
-| 纯 RSD | `Sender::new_rsd` / `try_new_rsd` | 0 | 鲁棒孤子 LT |
-
-底层编解码器对应：`LtEncoder::new` / `new_systematic` / `new_causal` 与
-`LtDecoder::new` / `new_systematic` / `new_causal`（均含 `try_*` 变体）。
-帧头的 flags 字节携带模式，接收端自动适配。
-
----
-
-## 帧完整性与流隔离
-
-- `Error::CorruptFrame` —— 帧未通过 BLAKE3 标签，或重建容器未通过
-  `stream_tag`。该帧作为擦除丢弃，解码器保持完好。
-- `Error::StreamConflict` —— 收到其它流身份的帧；当前进度保留，
-  `Receiver::reset` 切换流。
-- `Error::SequenceExhausted` —— 发送端 `u32` 序号在 `2^32` 帧后回绕。
-- `Receiver::try_push` 返回 `Result<Option<Vec<u8>>>`：未完成时
-  `Ok(None)`，完成时恰好一次 `Ok(Some(container))`（防止重复交付），
-  其余情况返回 `Err`。
-
----
-
-## 认证加密（防共收）
-
-光学信道是公开广播——**任何对准屏幕的摄像头都能收到相同的帧**。开启
-`encryption` 特性后，容器被加密，共收者或中途窥探者只能看到密文。
-
-- **AEAD** —— XChaCha20-Poly1305（RustCrypto，no_std），24 字节 nonce、
-  16 字节标签。容器头、文件名、类型与摘要均作为关联数据（AAD）认证：
-  任何字段被篡改都会在解密前失败。
-- **密钥派生** —— `EncryptionKey::from_password(password, salt)` 用
-  **Argon2id**（19 MiB、2 轮）派生 32 字节密钥，并在析构时零化
-  （`zeroize`）。24 字节 nonce 兼任 Argon2 盐，nonce 新鲜则密钥新鲜。
-- **Nonce** —— `random_nonce()`（std 构建）使用操作系统随机源；no_std
-  应用自行提供（如嵌入式 TRNG）。同一密钥下每个加密必须使用唯一 nonce。
-- **API** —— `pack_file_encrypted` / `pack_file_encrypted_with_password`；
-  `unpack_file_with_key` / `unpack_file_with_password`。无密钥、密钥错误、
-  或单个字节被翻转的加密容器都会被拒绝（已测）。
-
----
-
-## 性能与数据结构
-
-- **SIMD XOR 引擎**（`simd::xor_into`）——运行时派发 AVX2（经 `__cpuid`
-  + `_xgetbv` XCR0 状态校验）、SSE2、NEON、标量回退；通过 `core::arch`
-  支持 no_std。
-- **扁平字竞技场**（`LtDecoder`）——所有帧字存于单个 `Vec<u32>`，按索引
-  切分；索引在扩容下稳定，**每帧零堆分配**；不相交区间经 `split_at_mut`
-  做 XOR。
-- **两级量化度采样**（`DegreeCdf`）——1024 项分位数表把逆 CDF 搜索收敛
-  到缓存友好的小窗口；结果与二分搜索**完全相等**（对每个 K 在 2^20 网格
-  加 10 万随机采样上证明）。
-- **双射乘性哈希去重**（`U32Set`）——开放寻址，`v·0x9E3779B1 mod 2^t`
-  对低位是双射，因此**连续序号永不冲突**；位打包占用表；0.7 负载摊销
-  扩容。
-
-### 基准测试
-
-`criterion 0.8`，100 样本，3 秒预热，`-O3` + `lto`；硬件
-**Intel Core i7-11850H @ 2.50 GHz，32 GB**。`BLOCK_LEN = 2933`。可用
-`cargo bench` 复现。
-
-| 组 | 用例 | 中位时间 | 吞吐 |
-| --- | --- | --- | --- |
-| xor | 派发（AVX2） | 203.7 µs | 19.18 GiB/s |
-| xor | 标量参照 | 193.7 µs | 20.16 GiB/s |
-| degree_sample | 量化，K=357 | 10.46 µs | — |
-| degree_sample | 二分，K=357 | 29.73 µs | — |
-| degree_sample | 量化，K=11440 | 10.62 µs | — |
-| degree_sample | 二分，K=11440 | 49.87 µs | — |
-| dedup | u32_set_insert × 65536 | 292.9 µs | 约 2.24 亿次/秒 |
-| encode | 流式，1 MiB | 3.718 ms | 364.9 MiB/s |
-| encode | 流式，8 MiB | 56.92 ms | 187.8 MiB/s |
-| encode | 流式，32 MiB | 314.9 ms | 135.6 MiB/s |
-| decode | 剥皮，1 MiB | 1.212 ms | 825.1 MiB/s |
-| decode | 剥皮，8 MiB | 11.76 ms | 680.2 MiB/s |
-| decode | 剥皮，32 MiB | 65.89 ms | 485.7 MiB/s |
-
-按比特计（×8）：**解码 3.9–6.6 Gbps**、编码 1.1–2.9 Gbps——每个测量尺寸
-都高于 1 Gbps。编码随负载增大而降速，是因为从数 MB 的块表中随机取块受
-**内存延迟**约束（而非计算）；解码同表缓存较暖。消耗这些帧的光学信道本身
-只有约 0.1–0.2 MB/s——比编解码器慢三个数量级，编解码器永远不是信道瓶颈。
-
----
-
-## API 参考
-
-| 模块 | 公共接口 |
-| --- | --- |
-| `frame` | `FrameHeader`、`StreamIdentity`、`pack_frame`、`parse_frame`、`stream_identity`、`checksum32`、`frame_checksum`、`fnv1a`、`HEADER_LEN`、`MAGIC0/1`、`FLAG_SYSTEMATIC`、`FLAG_CAUSAL`、`MAX_FILE_BYTES`、`MAX_STREAM_BYTES` |
-| `fountain` | `LtEncoder`（`new`/`new_systematic`/`new_causal` + `try_*`、`encode`、`encode_into`、`k`、`block_len`、`session_id`、`is_causal`、`is_systematic`、`sys_span`）、`LtDecoder`（`new`/`new_systematic`/`new_causal` + `try_*`、`add_frame`、`assemble`、`is_complete`、`frames_new/dup/dropped`、`solved_count`）、`frame_indices` |
-| `session` | `Sender`（`new`/`new_systematic`/`new_rsd` + `try_*`、`from_packed`/`try_from_packed`、`try_next_frame`、`next_frame`、`k`、`session_id`、`is_causal`、`is_systematic`）、`Frame`（`to_bytes`）、`Receiver`（`new`、`reset`、`try_push`、`push`、`is_active`） |
-| `container` | `pack_file`、`pack_file_encrypted`、`pack_file_encrypted_with_password`、`unpack_file`、`unpack_file_with_key`、`unpack_file_with_password`、`verify_file`、`safe_file_name`、`is_precompressed_type`、`Compression`、`PackedOpticalFile`、`OpticalFile`、`FILE_HEADER_LEN` |
-| `crypto` *（encryption）* | `EncryptionKey`（`new`、`from_password`）、`random_nonce`、`encrypt`、`decrypt`、`NONCE_LEN`、`TAG_LEN` |
-| `capacity` | `block_length`、`source_block_count`、`fits_in_one_stream`、`minimum_frame_bytes`、`smallest_sufficient_frame_size`、`MAX_SOURCE_BLOCKS` |
-| `soliton` | `soliton_cdf`、`DegreeCdf`、`degree_binary`、`SOLITON_C`、`SOLITON_DELTA` |
-| `prng` | `SplitMix32`、`frame_seed` |
-| `set` | `U32Set` |
-| `simd` | `xor_into` |
-| `dlog` | `dlog` |
-| `error` | `Error`、`Result` |
-
----
-
-## 快速开始
+## 安装与特性
 
 ```toml
 [dependencies]
-deopti-transfer = { version = "0.1", features = ["encryption"] }
+deopti_transfer = "0.1.2"
 ```
 
-### 明文传输
+| 特性 | 默认 | 作用 |
+| --- | --- | --- |
+| `std` | 是 | 通过 `flate2` 压缩/解压 gzip |
+| `encryption` | 否 | Argon2id、XChaCha20-Poly1305、系统随机数、X25519 JRC/JRP、密钥清零 |
+
+```bash
+cargo build --release
+cargo build --release --no-default-features
+cargo build --release --no-default-features --features encryption
+```
+
+最后一种配置仍是 `no_std + alloc`；目标平台仍需提供 `getrandom` 所需的随机
+源，或者在支持的位置由应用传入外部生成的秘密密钥字节。
+
+## 完整传输流程
 
 ```rust
 use deopti_transfer::container::{pack_file, unpack_file};
 use deopti_transfer::session::{Receiver, Sender};
 
 let packed = pack_file("notes.txt", "text/plain", b"hello over light")?;
-
-let mut sender = Sender::try_from_packed(&packed, 1465, 0x0c_d1)?; // 因果模式
+let mut sender = Sender::try_from_packed(&packed, 1465, 0x0cd1)?;
 let mut receiver = Receiver::new();
 let mut recovered = None;
-for _ in 0..sender.k() as usize * 4 {
+
+for _ in 0..usize::from(sender.k()) * 4 {
     let frame = sender.try_next_frame()?;
     if let Some(container) = receiver.try_push(&frame.to_bytes())? {
         recovered = Some(container);
         break;
     }
 }
-let file = unpack_file(&recovered.expect("stream completed"))?;
+
+let container = recovered.ok_or(deopti_transfer::Error::InvalidStream)?;
+let file = unpack_file(&container)?;
 assert_eq!(file.bytes, b"hello over light");
+# Ok::<(), deopti_transfer::Error>(())
 ```
 
-### 加密传输（防共收）
+循环上限只是应用超时策略，不是解码保证。在有丢帧时，应继续产生新的序列号，
+直到完成、策略超时，或返回 `Error::SequenceExhausted`。
+
+## v3 帧协议
+
+每帧长度为 `25 + block_len` 字节，并且自描述：
+
+| 偏移 | 长度 | 字段 | 含义 |
+| ---: | ---: | --- | --- |
+| 0 | 2 | 魔数 | `D1 0F` |
+| 2 | 1 | 标志 | `0` 纯 RSD，`1` 直接系统码，`2` 因果模式 |
+| 3 | 2 | 会话 ID | 小端、发送方选择的标识符 |
+| 5 | 4 | 序列号 | 方程选择器 |
+| 9 | 2 | `K` | 源块数量 |
+| 11 | 2 | 块长 | 每帧负载字节数 |
+| 13 | 4 | 总长度 | 重建数据流字节数 |
+| 17 | 4 | 流标签 | BLAKE3(stream) 的前 32 位 |
+| 21 | 4 | 帧标签 | BLAKE3(各头字段, block) 的前 32 位 |
+| 25 | 可变 | 块 | LT 方程负载 |
+
+`parse_frame` 在方程进入解码器之前校验魔数、标志、长度和帧标签。
+`Receiver` 锁定完整的恒定流身份
+`(flags, session_id, K, block_len, total_len, stream_tag)`。
+
+这些标签是截断的无密钥哈希。它们适合检测偶然损坏；在理想随机碰撞模型下，
+每次检查的碰撞概率为 `2^-32`。它们不能认证发送者，主动攻击者可以重新计算
+两个标签。需要负载认证时使用加密容器；需要发送者身份时还必须在应用层签名。
+
+## 喷泉码构造
+
+将长度为 `L` 的数据流分为 `K = ceil(L / B)` 个 `B` 字节源块
+`x_0,...,x_{K-1}`，只在内部为最后一块补零。
+
+### 因果首段
+
+前 `K` 个方程为：
+
+```text
+y_0 = x_0
+y_i = x_(i-1) XOR x_i,  1 <= i < K.
+```
+
+在 `GF(2)` 上有 `y = A x`，其中 `A` 是主对角线和次对角线均为 1 的
+下双对角矩阵。因为 `A` 是三角矩阵，
+
+```text
+det(A) = product_i A[i,i] = 1,
+```
+
+所以对所有 `K >= 1`，`A` 都可逆。逆变换可显式写成：
+
+```text
+x_i = y_0 XOR y_1 XOR ... XOR y_i.
+```
+
+因此，只要前段全部 `K` 个不同帧都收到，无论到达顺序如何，都恰好用 `K`
+帧重建。该定理只针对完整收到这 `K` 个方程；若缺少任意一个，已收到子矩阵
+不保证可逆，必须依赖修复帧。
+
+### 鲁棒孤子修复尾流
+
+当 `seq >= K` 时，收发双方通过 `SplitMix32(session_id, seq)` 推导相同的
+度数与源块子集。设 `c = 0.1`、`delta = 0.5`：
+
+```text
+R = max(1, c * ln(K / delta) * sqrt(K)),
+s = min(K, ceil(K / R)),
+rho(1) = 1/K,
+rho(d) = 1/(d(d-1))                       当 d >= 2，
+tau(d) = R/(dK)                           当 d < s，
+tau(s) = R * max(0, ln(R/delta)) / K，
+mu(d) = (rho(d) + tau(d)) / sum_j(rho(j) + tau(j)).
+```
+
+编码器 XOR 被选中的不同源块，解码器执行标准的一度剥离。
+
+鲁棒孤子分析只在其采样模型下给出概率性能；它不保证任意有限帧集合都可解，
+也不能推出通用的 `1.15K` 上限。测试中的确定性丢帧场景属于回归检查，不是
+对所有信道的数学证明。
+
+### 模式
+
+| 构造函数 | 前 `K` 帧 | 尾流 |
+| --- | --- | --- |
+| `Sender::try_new` | 因果变换 | 鲁棒孤子 |
+| `Sender::try_new_systematic` | 直接源块 | 鲁棒孤子 |
+| `Sender::try_new_rsd` | 立即使用鲁棒孤子 | 鲁棒孤子 |
+
+## 解码资源模型
+
+线格式字段必须按敌意输入处理。`LtDecoder` 分配前要求：
+
+- `K > 0`、`block_len > 0`、`total_len > 0`；
+- `K = ceil(total_len / block_len)`；
+- `K <= 65,535` 且 `total_len <= MAX_STREAM_BYTES`。
+
+方程数据区最多保存四个源流等价大小；待处理邻接项累计最多 `64 * K`。超过
+预算的帧计入 `frames_dropped()`，且不会写入重复帧集合，从而阻止构造高阶
+方程导致元数据无界增长。
+
+应用还应在接收第一帧前设置部署相关上限：
 
 ```rust
-use deopti_transfer::container::unpack_file_with_password;
+use deopti_transfer::{Receiver, ReceiverLimits};
+
+let receiver = Receiver::with_limits(ReceiverLimits {
+    max_stream_bytes: 8 * 1024 * 1024,
+    max_source_blocks: 8192,
+    max_block_len: 4096,
+});
+assert_eq!(receiver.limits().max_stream_bytes, 8 * 1024 * 1024);
+```
+
+## DCF3 文件容器
+
+DCF3 由固定 73 字节头、清理后的文件名、校验后的 MIME 和传输数据组成。头中
+含有标志、元数据长度、原始长度、传输长度、BLAKE3 摘要和 24 字节 nonce。
+
+- 原文件最大 64 MiB。
+- gzip 只在启用 `std`、媒体不是已压缩类型、文件至少 768 字节且至少节省
+  64 字节时使用。
+- 解压输出严格限制为声明的原长度，并校验 gzip `ISIZE`。
+- 接收文件名会移除路径分量、控制字符、双向文本控制符、Windows 非法字符、
+  尾随点/空格及保留设备名歧义。
+- MIME 必须具有合法 ASCII `type/subtype`，不得含控制或非 ASCII 字节。
+- 文件摘要用于损坏检测，不是签名或 MAC。
+
+## 认证加密
+
+启用 `encryption` 后，可使用 32 字节 `EncryptionKey` 或口令 API。DCF3 先
+压缩文件数据，再用 XChaCha20-Poly1305 加密；标志、长度、摘要、文件名和
+MIME 都作为关联数据，任何修改都会被拒绝。
+
+```rust
+use deopti_transfer::container::{
+    pack_file_encrypted_with_password, unpack_file_with_password,
+};
 use deopti_transfer::crypto::random_nonce;
 
 let nonce = random_nonce()?;
-let packed = deopti_transfer::pack_file_encrypted_with_password(
-    "secret.txt", "text/plain", b"top secret", b"correct horse battery staple", &nonce,
+let packed = pack_file_encrypted_with_password(
+    "secret.txt",
+    "text/plain",
+    b"classified",
+    b"correct horse battery staple",
+    &nonce,
 )?;
-let file = unpack_file_with_password(&packed.container, b"correct horse battery staple")?;
-assert_eq!(file.bytes, b"top secret");
+let file = unpack_file_with_password(
+    &packed.container,
+    b"correct horse battery staple",
+)?;
+assert_eq!(file.bytes, b"classified");
+# Ok::<(), deopti_transfer::Error>(())
 ```
 
-对于有损或乱序信道，持续推送帧即可——解码器在收到足够的不同帧后自然完成。
+口令派生参数为 Argon2id v1.3、19 MiB、两次迭代、单 lane、32 字节输出。
+24 字节 nonce 同时作为口令盐。对同一个直接密钥复用 nonce，或在相同口令
+模式下复用 nonce，都是不安全的；每个加密容器都应随机生成。普通加密 DCF3
+的文件名、MIME、长度和摘要仍然公开。
 
----
+## JRC：指定裁决者恢复
 
-## no_std、特性、依赖
+JRC 将整个内部 DCF3（包括元数据）对外部接收者隐藏，同时允许一个裁决者
+密钥恢复：
+
+```text
+(dk, ek)      = X25519 裁决者密钥对
+(e_sk, e_pk)  = 新生成的临时 X25519 密钥对
+shared        = X25519(e_sk, ek)
+k_enc         = BLAKE3 derive_key("deopti-transfer jrc enc v1", context)
+k_com         = BLAKE3 derive_key("deopti-transfer jrc com v1", context)
+c             = BLAKE3 keyed_hash(k_com, message)
+ct            = XChaCha20-Poly1305(k_enc, nonce, message, aad = c)
+aux           = e_pk || nonce || ct
+```
+
+其中 `context = shared || e_pk || ek || nonce`。线格式为
+`"JRC\x01" || c || aux`，固定开销 108 字节。创建与恢复都会拒绝非贡献型
+X25519 输入。
+
+```rust
+use deopti_transfer::crypto::random_nonce;
+use deopti_transfer::{keygen, pack_file_jrc, unpack_file_jrc};
+
+let judge = keygen()?;
+let nonce = random_nonce()?;
+let packed = pack_file_jrc(
+    "report.pdf",
+    "application/pdf",
+    b"document bytes",
+    &judge.ek,
+    &nonce,
+)?;
+
+// 将 packed.envelope 交给 Sender/Receiver 传输。
+let file = unpack_file_jrc(&packed.envelope, &judge.dk)?;
+assert_eq!(file.bytes, b"document bytes");
+# Ok::<(), deopti_transfer::Error>(())
+```
+
+### 条件化安全陈述
+
+以下结论依赖：随机预言机模型中的 X25519 hashed Diffie-Hellman、域分离
+BLAKE3 KDF/PRF 安全性、256 位密钥化承诺的多密钥碰撞抗性，以及
+XChaCha20-Poly1305 AEAD 安全性：
+
+1. 正确性：诚实的 X25519 双方得到相同共享秘密；AEAD 解密逆转加密，重算
+   承诺一致。
+2. 外部隐藏：对等长消息，先把 hashed-DH 密钥替换为随机密钥，再分别应用
+   AEAD 机密性与密钥化 PRF 安全性。
+3. 计算绑定：同一 `c` 的两个可接受 opening 若恢复出不同消息，将直接导出
+   攻击者影响的密钥化承诺实例之间的碰撞。仅有 PRF 安全性不足以推出此结论，
+   这里明确假设多密钥碰撞抗性。
+4. 裁决者专属机密性：没有 `dk` 时，等长挑战消息计算不可区分；这并不阻止
+   攻击者利用外部信息猜测低熵消息。
+
+JRC 会泄露封套长度，不认证承诺创建者，长期裁决者密钥泄露后也不具备历史
+前向保密。`dk` 应与光学收发设备隔离保存，并按敏感 32 字节密钥备份。
+
+## JRP：关系证明组合
+
+JRP2 不把哈希标签冒充证明。它要求应用实现 `RelationProofSystem`，并以零知识
+证明知道 `(witness, output, JRC opening)`，满足：
+
+```text
+JRC.Commit(ek, output; opening) = 公开承诺
+R(statement, witness) = true
+output = f(statement, witness).
+```
+
+`jrp::prove` 生成 JRC 承诺，要求后端证明精确关系，自校验后输出
+`"JRP\x02" || proof_len || relation_proof || JRC-envelope`。
+`jrp::verify_ext` 针对语句、裁决者公钥和完整 JRC 转写调用后端；
+`jrp::judge_recover` 先验证，接受后才解密。
+
+本库不内置通用 ZK 后端。这是刻意的生产边界：实际选择必须明确电路、验证
+密钥生命周期、可信设置策略、大小预算和安全级别。JRP 的完备性、可靠性与
+零知识完全继承所选后端；只实现公开输入哈希违反 trait 契约。
+
+## 性能
+
+热路径使用字数组、确定性度数表、开放寻址序列去重和 SIMD XOR。本项目不
+声明固定吞吐数字，因为结果取决于 CPU、编译器、块长、负载大小和模式。
 
 ```bash
-# 纯 no_std + alloc 构建（无 gzip、无加密）
-cargo build --release --no-default-features
-
-# 开启加密（Argon2id + XChaCha20-Poly1305，均为 no_std）
-cargo build --release --no-default-features --features encryption
+cargo bench
 ```
 
-| 特性 | 引入 | 作用 |
-| --- | --- | --- |
-| `std`（默认） | `flate2` | 容器 gzip 压缩 |
-| `encryption` | `argon2`、`chacha20poly1305`、`getrandom`、`zeroize` | 容器认证加密 |
+Criterion 解码基准会先确认预生成帧集合确实完成重建，不会把未完成解码当作
+成功吞吐量。
 
-运行时依赖全部支持 no_std：`rustbinary`（二进制编解码）、`serde`
-（derive）、`blake3`（哈希）、`libm`（no_std 浮点），以及可选的
-`flate2` / `argon2` / `chacha20poly1305` / `getrandom` / `zeroize`。
+## 验证命令
 
----
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo test --all-features
+cargo check --no-default-features
+cargo check --no-default-features --features encryption
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo package --allow-dirty
+```
 
-## 正确性与安全
+测试覆盖线格式黄金向量、确定性对数/CDF 指纹、三种传输模式、丢帧与重复帧、
+畸形容器、解压上限、元数据校验、接收分配策略、SIMD 等价性与长度安全、
+AEAD/JRC 篡改、非贡献型 X25519 密钥、JRP 关系/篡改行为以及 `no_std` 编译。
 
-- **黄金向量**（`tests/golden.rs`）钉死线上格式：帧头字节、RSD 与系统性/
-  因果编码流、`dlog` 的穷举 FNV-1a 指纹，以及量化采样等价性证明。
-- **往返测试**（`tests/roundtrip.rs`）覆盖：有损与乱序下的喷泉、因果编织
-  的乱序与孤立断链、加密容器（错误密钥、篡改、缺密钥）、以及构造的头部
-  放大攻击。
-- 来自光学信道的每个字段在使用前都被校验；唯一的 `unsafe` 是有界检查的
-  `u32 ↔ u8` 重解释与 SIMD 内核。
-- `#![forbid(unsafe_op_in_unsafe_fn)]`，`cargo clippy --all-features
-  --all-targets` 零警告，所有特性组合均能 `--release` 构建。
+测试只能确认已测输入上的实现行为，不能证明密码学假设、通用喷泉码开销、
+学术原创性或所有目标平台的侧信道安全。
 
----
+## 运行限制
+
+- 本库不包含二维码/条码渲染、摄像头管线、界面或设备发现。
+- 喷泉解码处理擦除和已校验方程，不是拜占庭纠错码。
+- 第一条外观合法的帧可以锁定接收器并造成拒绝服务；应使用超时、`reset`、
+  接收上限，并在必要时认证发送者。
+- 会话 ID 和完整性标签都是短协议字段，不是安全身份。
+- 发送序列空间是有限的 `u32`；检查型 API 会报告耗尽。
+- 修改线格式必须发布新版本并更新黄金向量。
 
 ## 许可证
 
-Apache-2.0。见 [LICENSE](LICENSE)。
+Apache-2.0，见 [LICENSE](LICENSE)。

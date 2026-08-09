@@ -25,7 +25,11 @@ impl SplitMix32 {
 
     #[inline]
     pub fn next_bounded(&mut self, bound: u32) -> u32 {
-        self.next_u32() % bound
+        if bound == 0 {
+            0
+        } else {
+            self.next_u32() % bound
+        }
     }
 }
 

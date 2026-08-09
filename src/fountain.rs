@@ -2,10 +2,11 @@
 //! soliton modes.
 //!
 //! [`LtEncoder`] streams frames for `seq = 0, 1, 2, ...`; [`LtDecoder`]
-//! peels the payload out of any ~K·1.15 distinct frames. The causal weave
-//! first phase (`y[0] = x[0]`, `y[i] = x[i-1] ^ x[i]`) reconstructs the
-//! payload in exactly K frames at zero loss. Both sides derive every block
-//! subset deterministically, so the stream is pinned by golden-vector tests.
+//! peels degree-one equations until all blocks are known. The causal first
+//! phase (`y[0] = x[0]`, `y[i] = x[i-1] ^ x[i]`) reconstructs in exactly K
+//! distinct frames when that phase has no loss. Completion with missing
+//! frames is probabilistic, not a fixed-overhead guarantee. Both sides derive
+//! every repair subset deterministically, and golden vectors pin the stream.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -20,8 +21,12 @@ use crate::simd::xor_into;
 use crate::soliton::{degree_binary, DegreeCdf};
 
 const DENSE_LIMIT: usize = 256;
+const MAX_PENDING_EDGES_PER_BLOCK: usize = 64;
 
 pub fn frame_indices(k: usize, cdf: &[f64], session_id: u32, seq: u32) -> Vec<u32> {
+    if k == 0 || cdf.len() != k {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut scratch = Vec::new();
     let mut rnd = SplitMix32::new(frame_seed(session_id, seq));
@@ -338,6 +343,8 @@ pub struct LtDecoder {
     idx_scratch: Vec<u32>,
     arena: Vec<u32>,
     max_arena_words: usize,
+    max_pending_edges: usize,
+    pending_edges: usize,
     frames_new: usize,
     frames_dup: usize,
     frames_dropped: usize,
@@ -405,6 +412,7 @@ impl LtDecoder {
         }
         let words = block_len.div_ceil(4);
         let max_arena_words = k.saturating_mul(words).saturating_mul(4);
+        let max_pending_edges = k.saturating_mul(MAX_PENDING_EDGES_PER_BLOCK);
         Ok(Self {
             k,
             block_len,
@@ -423,6 +431,8 @@ impl LtDecoder {
             idx_scratch: Vec::new(),
             arena: Vec::with_capacity((k * words).min(1 << 21)),
             max_arena_words,
+            max_pending_edges,
+            pending_edges: 0,
             frames_new: 0,
             frames_dup: 0,
             frames_dropped: 0,
@@ -472,54 +482,69 @@ impl LtDecoder {
         if self.is_complete() {
             return;
         }
-        if self.arena.len().saturating_add(self.words) > self.max_arena_words {
-            self.frames_dropped += 1;
-            return;
-        }
-        if !self.seen.insert(seq) {
+        if self.seen.contains(seq) {
             self.frames_dup += 1;
             return;
         }
-        self.frames_new += 1;
-
-        let off = self.arena.len();
-        self.arena.resize(off + self.words, 0);
-        {
-            words_as_bytes_mut(&mut self.arena[off..off + self.words])[..self.block_len]
-                .copy_from_slice(block);
-        }
-
         if (seq as usize) < self.sys_span && !self.causal {
             let b = ((seq as usize) % self.k) as u32;
-            self.resolve(b, off);
-            return;
+            self.idx.clear();
+            self.idx.push(b);
+        } else {
+            if (seq as usize) < self.sys_span {
+                self.idx.clear();
+                if seq != 0 {
+                    self.idx.push(seq - 1);
+                }
+                self.idx.push(seq);
+            } else {
+                frame_indices_into(
+                    &mut self.idx,
+                    &mut self.idx_scratch,
+                    &self.cdf,
+                    self.session_id,
+                    seq,
+                );
+            }
         }
 
-        if (seq as usize) < self.sys_span {
-            self.idx.clear();
-            if seq != 0 {
-                self.idx.push(seq - 1);
-            }
-            self.idx.push(seq);
-        } else {
-            frame_indices_into(
-                &mut self.idx,
-                &mut self.idx_scratch,
-                &self.cdf,
-                self.session_id,
-                seq,
-            );
-        }
         let mut unsolved = Vec::with_capacity(8);
         for &b in self.idx.iter() {
-            match self.solved[b as usize] {
-                Some(s_off) => xor_at(&mut self.arena, off, s_off, self.words),
-                None => unsolved.push(b),
+            if self.solved[b as usize].is_none() {
+                unsolved.push(b);
             }
         }
+
+        let new_edges = if unsolved.len() > 1 {
+            unsolved.len()
+        } else {
+            0
+        };
+        if self.arena.len().saturating_add(self.words) > self.max_arena_words
+            || self.pending_edges.saturating_add(new_edges) > self.max_pending_edges
+        {
+            self.frames_dropped += 1;
+            return;
+        }
+        let inserted = self.seen.insert(seq);
+        debug_assert!(
+            inserted,
+            "sequence was checked immediately before insertion"
+        );
+        self.frames_new += 1;
 
         if unsolved.is_empty() {
             return;
+        }
+
+        let off = self.arena.len();
+        self.arena.resize(off + self.words, 0);
+        words_as_bytes_mut(&mut self.arena[off..off + self.words])[..self.block_len]
+            .copy_from_slice(block);
+        for &b in self.idx.iter() {
+            if let Some(s_off) = self.solved[b as usize] {
+                xor_at(&mut self.arena, off, s_off, self.words);
+            }
         }
         if unsolved.len() == 1 {
             let b = unsolved[0];
@@ -528,6 +553,7 @@ impl LtDecoder {
         }
 
         let frame_id = self.frames.len();
+        self.pending_edges += unsolved.len();
         for &b in &unsolved {
             self.by_block[b as usize].push(frame_id);
         }
@@ -607,4 +633,36 @@ fn checked_encoder_k(payload: &[u8], block_len: usize) -> Result<usize> {
         return Err(Error::InvalidStream);
     }
     Ok(k)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_public_index_inputs_are_total() {
+        assert!(frame_indices(0, &[], 1, 1).is_empty());
+        assert!(frame_indices(2, &[1.0], 1, 1).is_empty());
+    }
+
+    #[test]
+    fn resource_drops_do_not_poison_sequence_deduplication() {
+        let k = 32;
+        let block_len = 64;
+        let total_len = k * block_len;
+        let mut decoder = LtDecoder::new(k, block_len, 7, total_len);
+        let seq = (0u32..10_000)
+            .find(|&seq| frame_indices(k, decoder.cdf.cdf(), 7, seq).len() > 1)
+            .expect("a degree > 1 frame");
+        decoder.max_pending_edges = 0;
+        decoder.add_frame(seq, &[0u8; 64]);
+        assert_eq!(decoder.frames_dropped(), 1);
+        assert_eq!(decoder.frames_new(), 0);
+        assert!(!decoder.seen.contains(seq));
+
+        decoder.max_pending_edges = k * MAX_PENDING_EDGES_PER_BLOCK;
+        decoder.add_frame(seq, &[0u8; 64]);
+        assert_eq!(decoder.frames_new(), 1);
+        assert!(decoder.seen.contains(seq));
+    }
 }
